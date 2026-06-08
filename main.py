@@ -30,12 +30,29 @@ def main() -> None:
     dataset.print_summary()
 
     # ---------------------------------------------------------
-    # 2. Сервис извлечения точек
+    # 2. Единая рабочая метрическая CRS для всех стратегий
+    # ---------------------------------------------------------
+    # Вариант 1: зафиксировать вручную, если ты точно знаешь зону
+    # working_crs = "EPSG:32637"
+
+    # Вариант 2: оценить по главной линии
+    main_gdf = dataset.main_gdf
+    if main_gdf.crs is None:
+        raise ValueError("dataset.main_gdf has no CRS")
+
+    working_crs = main_gdf.estimate_utm_crs()
+    if working_crs is None:
+        raise ValueError("Failed to estimate working metric CRS from main coastline")
+
+    logger.info(f"Working metric CRS: {working_crs}")
+
+    # ---------------------------------------------------------
+    # 3. Сервис извлечения точек
     # ---------------------------------------------------------
     extractor = CoastlinePointExtractor()
 
     # ---------------------------------------------------------
-    # 3. Узловые точки только главной линии
+    # 4. Узловые точки только главной линии
     #    endpoints_only=False -> все вершины main
     # ---------------------------------------------------------
     node_points = extractor.extract(
@@ -61,14 +78,16 @@ def main() -> None:
     )
 
     # ---------------------------------------------------------
-    # 4. Точки через равный шаг только по главной линии
+    # 5. Точки через равный шаг только по главной линии
+    #    шаг теперь задаётся в МЕТРАХ
     # ---------------------------------------------------------
     step_points = extractor.extract(
         dataset=dataset,
         strategy=EqualStepAlongLineStrategy(
-            step=0.001,  # шаг в единицах CRS
+            step_m=150.0,
             source=PointSource.MAIN_ONLY,
             include_endpoints=True,
+            working_crs=str(working_crs),
         ),
         name="novoross_main_step_points",
     )
@@ -81,15 +100,17 @@ def main() -> None:
     )
 
     # ---------------------------------------------------------
-    # 5. Точки по радиусу от начала только по главной линии
+    # 6. Точки по радиусу от начала только по главной линии
+    #    радиус теперь задаётся в МЕТРАХ
     # ---------------------------------------------------------
     radius_points = extractor.extract(
         dataset=dataset,
         strategy=EqualRadiusStrategy(
-            radius_step=0.002,
+            radius_step_m=500.0,
             source=PointSource.MAIN_ONLY,
             include_origin=True,
             include_endpoint=True,
+            working_crs=str(working_crs),
         ),
         name="novoross_main_radius_points",
     )
@@ -102,7 +123,7 @@ def main() -> None:
     )
 
     # ---------------------------------------------------------
-    # 6. Комбинированный набор только для главной линии
+    # 7. Комбинированный набор только для главной линии
     #    endpoints main + равный шаг main + радиусы main
     # ---------------------------------------------------------
     combined_points = extractor.extract(
@@ -115,15 +136,17 @@ def main() -> None:
                     unique=True,
                 ),
                 EqualStepAlongLineStrategy(
-                    step=0.001,
+                    step_m=150.0,
                     source=PointSource.MAIN_ONLY,
                     include_endpoints=True,
+                    working_crs=str(working_crs),
                 ),
                 EqualRadiusStrategy(
-                    radius_step=0.0015,
+                    radius_step_m=500.0,
                     source=PointSource.MAIN_ONLY,
                     include_origin=True,
                     include_endpoint=True,
+                    working_crs=str(working_crs),
                 ),
             ],
             drop_duplicates=True,

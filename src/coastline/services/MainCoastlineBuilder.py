@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import geopandas as gpd
 import networkx as nx
-from shapely import node as shapely_node, segmentize, snap, unary_union
-from shapely.geometry import LineString, MultiLineString
+from shapely import node as shapely_node, snap, unary_union
+from shapely.geometry import LineString, MultiLineString, Point
+from shapely.ops import linemerge
 
 
 @dataclass
@@ -17,22 +19,20 @@ class CoastlineBuildResult:
 
 class MainCoastlineBuilder:
     """
-    Надёжное выделение главной трассы береговой линии.
+    Выделение главной береговой линии с сохранением исходных вершин
+    и последующим спрямлением искусственно добавленных сегментов.
 
-    Ключевая идея:
-    - работаем в метрической CRS;
-    - строим плотный граф по всем вершинам;
-    - берём крупнейшую компоненту;
-    - превращаем её в дерево;
-    - prune короткие боковые ветки;
-    - берём диаметр оставшегося дерева;
-    - сохраняем главную трассу как набор сегментов, а не forcing в один LineString.
-
-    Это специально сделано, чтобы не терять сегменты на развилках, где line_merge
-    не может сшить линии через узлы степени 3+.
+    Новая логика:
+    - сохраняем исходные вершины до любых модификаций;
+    - строим топологически корректную сеть;
+    - выделяем главную трассу;
+    - после этого удаляем лишние точки, оставляя только:
+        * исходные вершины,
+        * точки пересечений,
+        * реальные точки излома.
     """
 
-    _COORD_ROUND = 2  # сантиметровая точность в метрах
+    _COORD_ROUND = 3
 
     def __init__(
         self,
@@ -43,9 +43,11 @@ class MainCoastlineBuilder:
         output_crs: str = "EPSG:4326",
         working_crs: str | None = None,
         snap_tolerance_m: float = 3.0,
-        segmentize_step_m: float = 10.0,
-        prune_leaf_length_m: float = 50.0,
-        prune_iterations: int = 20,
+        prune_leaf_length_m: float = 80.0,
+        prune_iterations: int = 30,
+        angle_tolerance_deg: float = 1.0,
+        keep_intersection_buffer_m: float = 0.05,
+        original_vertex_buffer_m: float = 0.05,
     ) -> None:
         self.input_path = Path(input_path)
         self.coastline_output_path = (
@@ -60,9 +62,12 @@ class MainCoastlineBuilder:
         self.working_crs = working_crs
 
         self.snap_tolerance_m = float(snap_tolerance_m)
-        self.segmentize_step_m = float(segmentize_step_m)
         self.prune_leaf_length_m = float(prune_leaf_length_m)
         self.prune_iterations = int(prune_iterations)
+
+        self.angle_tolerance_deg = float(angle_tolerance_deg)
+        self.keep_intersection_buffer_m = float(keep_intersection_buffer_m)
+        self.original_vertex_buffer_m = float(original_vertex_buffer_m)
 
         self.log = logger.bind(
             builder=self.__class__.__name__,
@@ -87,20 +92,18 @@ class MainCoastlineBuilder:
         self.log.info(f"Working CRS: {work_crs}")
         gdf_work = gdf.to_crs(work_crs)
 
-        lines = self._extract_lines(gdf_work)
-        lines = self._snap_lines(lines)
-        lines = self._segmentize_lines(lines)
-        lines = self._node_lines(lines)
+        raw_lines = self._extract_lines(gdf_work)
+        original_points = self._collect_original_vertices(raw_lines)
 
-        graph = self._build_graph(lines)
+        snapped_lines = self._snap_lines(raw_lines)
+        noded_lines = self._node_lines(snapped_lines)
+
+        graph = self._build_graph(noded_lines)
         self.log.info(
             f"Graph built: nodes={graph.number_of_nodes()}, edges={graph.number_of_edges()}"
         )
 
-        components = [
-            graph.subgraph(c).copy()
-            for c in nx.connected_components(graph)
-        ]
+        components = [graph.subgraph(c).copy() for c in nx.connected_components(graph)]
         if not components:
             raise ValueError("No connected components found")
 
@@ -112,25 +115,23 @@ class MainCoastlineBuilder:
             f"edges={main_component.number_of_edges()}"
         )
 
-        # 1) Удаляем циклы: получаем дерево
         tree = self._maximum_spanning_tree(main_component)
-
-        # 2) Подрезаем короткие листья
         trunk_tree = self._prune_short_leaves(tree)
 
         if trunk_tree.number_of_edges() == 0:
             raise ValueError("Trunk tree is empty after pruning")
 
-        # 3) Диаметр дерева = главная трасса
         backbone_nodes = self._tree_diameter_path(trunk_tree)
         main_edge_keys = self._path_to_edge_keys(backbone_nodes)
 
-        # 4) Собираем результат
+        intersection_points = self._collect_intersection_points(main_component)
+
         result_work = self._build_result(
             main_component=main_component,
-            trunk_tree=trunk_tree,
             main_edge_keys=main_edge_keys,
             other_components=other_components,
+            original_points=original_points,
+            intersection_points=intersection_points,
             crs=work_crs,
         )
 
@@ -159,7 +160,7 @@ class MainCoastlineBuilder:
             self.log.info(f"Saved other lines to {self.other_lines_output_path}")
 
     # ============================================================
-    # Input and preprocessing
+    # Input
     # ============================================================
 
     def _read(self) -> gpd.GeoDataFrame:
@@ -195,6 +196,14 @@ class MainCoastlineBuilder:
         self.log.info(f"Extracted {len(lines)} line(s)")
         return lines
 
+    def _collect_original_vertices(self, lines: list[LineString]) -> list[Point]:
+        points: list[Point] = []
+        for line in lines:
+            for xy in line.coords:
+                points.append(Point(xy))
+        self.log.info(f"Collected {len(points)} original vertex points")
+        return points
+
     def _snap_lines(self, lines: list[LineString]) -> list[LineString]:
         if self.snap_tolerance_m <= 0:
             return lines
@@ -211,16 +220,6 @@ class MainCoastlineBuilder:
             snapped[i] = current
 
         return snapped
-
-    def _segmentize_lines(self, lines: list[LineString]) -> list[LineString]:
-        if self.segmentize_step_m <= 0:
-            return lines
-
-        self.log.info(f"Segmentizing with step={self.segmentize_step_m} m")
-        return [
-            segmentize(line, max_segment_length=self.segmentize_step_m)
-            for line in lines
-        ]
 
     def _node_lines(self, lines: list[LineString]) -> list[LineString]:
         self.log.info("Noding network")
@@ -242,7 +241,7 @@ class MainCoastlineBuilder:
         return parts
 
     # ============================================================
-    # Graph building
+    # Graph
     # ============================================================
 
     def _ck(self, xy: tuple[float, float]) -> tuple[float, float]:
@@ -259,28 +258,24 @@ class MainCoastlineBuilder:
             if len(coords) < 2:
                 continue
 
-            for a, b in zip(coords[:-1], coords[1:]):
-                u = self._ck(a)
-                v = self._ck(b)
-                if u == v:
-                    continue
+            start = self._ck(coords[0])
+            end = self._ck(coords[-1])
 
-                geom = LineString([a, b])
-                weight = float(geom.length)
+            geom = LineString(coords)
+            weight = float(geom.length)
 
-                if g.has_edge(u, v):
-                    # сохраняем более длинную геометрию как representative
-                    if g[u][v]["weight"] < weight:
-                        g[u][v]["weight"] = weight
-                        g[u][v]["geometry"] = geom
-                else:
-                    g.add_edge(
-                        u,
-                        v,
-                        geometry=geom,
-                        weight=weight,
-                        edge_key=self._ek(u, v),
-                    )
+            if g.has_edge(start, end):
+                if g[start][end]["weight"] < weight:
+                    g[start][end]["weight"] = weight
+                    g[start][end]["geometry"] = geom
+            else:
+                g.add_edge(
+                    start,
+                    end,
+                    geometry=geom,
+                    weight=weight,
+                    edge_key=self._ek(start, end),
+                )
 
         if g.number_of_edges() == 0:
             raise ValueError("Graph has no edges")
@@ -292,10 +287,6 @@ class MainCoastlineBuilder:
     # ============================================================
 
     def _maximum_spanning_tree(self, graph: nx.Graph) -> nx.Graph:
-        """
-        Используем maximum spanning tree, чтобы сохранить длинные магистральные рёбра,
-        а не случайно выбросить их как в minimum spanning tree.
-        """
         self.log.info("Building maximum spanning tree")
         tree = nx.maximum_spanning_tree(graph, weight="weight")
         self.log.info(
@@ -305,10 +296,6 @@ class MainCoastlineBuilder:
         return tree
 
     def _leaf_branch_length(self, tree: nx.Graph, leaf) -> tuple[float, list]:
-        """
-        Идём от leaf до первого узла со степенью != 2.
-        Возвращаем длину ветви и список рёбер этой ветви.
-        """
         if tree.degree(leaf) != 1:
             return 0.0, []
 
@@ -336,10 +323,6 @@ class MainCoastlineBuilder:
         return total_length, branch_edges
 
     def _prune_short_leaves(self, tree: nx.Graph) -> nx.Graph:
-        """
-        Многократно удаляем короткие листовые ветки.
-        Это намного стабильнее, чем пытаться угадать магистраль одним shortest path.
-        """
         self.log.info(
             f"Pruning short leaves: threshold={self.prune_leaf_length_m} m, "
             f"iterations={self.prune_iterations}"
@@ -378,9 +361,6 @@ class MainCoastlineBuilder:
         return max(lengths, key=lengths.get)
 
     def _tree_diameter_path(self, tree: nx.Graph) -> list:
-        """
-        Для дерева double sweep даёт диаметр корректно.
-        """
         self.log.info("Computing tree diameter path")
 
         start = next(iter(tree.nodes()))
@@ -396,10 +376,134 @@ class MainCoastlineBuilder:
         return path
 
     def _path_to_edge_keys(self, path_nodes: list) -> set[tuple]:
-        return {
-            self._ek(u, v)
-            for u, v in zip(path_nodes[:-1], path_nodes[1:])
-        }
+        return {self._ek(u, v) for u, v in zip(path_nodes[:-1], path_nodes[1:])}
+
+    def _collect_intersection_points(self, graph: nx.Graph) -> list[Point]:
+        pts = []
+        for node in graph.nodes():
+            if graph.degree(node) >= 3:
+                pts.append(Point(node))
+        self.log.info(f"Collected {len(pts)} intersection point(s)")
+        return pts
+
+    # ============================================================
+    # Geometry simplification based on original vertices
+    # ============================================================
+
+    @staticmethod
+    def _segment_bearing(p1: tuple[float, float], p2: tuple[float, float]) -> float:
+        return math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+
+    @staticmethod
+    def _angle_diff_deg(a: float, b: float) -> float:
+        diff = math.degrees(abs(a - b)) % 360.0
+        if diff > 180.0:
+            diff = 360.0 - diff
+        if diff > 90.0:
+            diff = 180.0 - diff
+        return diff
+
+    def _is_protected_point(
+        self,
+        pt: Point,
+        original_points_union,
+        intersection_points_union,
+    ) -> bool:
+        if original_points_union is not None:
+            if pt.distance(original_points_union) <= self.original_vertex_buffer_m:
+                return True
+
+        if intersection_points_union is not None:
+            if pt.distance(intersection_points_union) <= self.keep_intersection_buffer_m:
+                return True
+
+        return False
+
+    def _simplify_linestring_by_anchors(
+        self,
+        line: LineString,
+        original_points_union,
+        intersection_points_union,
+    ) -> LineString:
+        coords = list(line.coords)
+        if len(coords) <= 2:
+            return line
+
+        kept = [coords[0]]
+
+        for i in range(1, len(coords) - 1):
+            prev_pt = coords[i - 1]
+            cur_pt = coords[i]
+            next_pt = coords[i + 1]
+
+            p = Point(cur_pt)
+
+            # Сохраняем все исходные вершины и точки пересечений
+            if self._is_protected_point(
+                p,
+                original_points_union=original_points_union,
+                intersection_points_union=intersection_points_union,
+            ):
+                kept.append(cur_pt)
+                continue
+
+            a1 = self._segment_bearing(prev_pt, cur_pt)
+            a2 = self._segment_bearing(cur_pt, next_pt)
+            diff = self._angle_diff_deg(a1, a2)
+
+            # Если это реальный излом — тоже сохраняем
+            if diff > self.angle_tolerance_deg:
+                kept.append(cur_pt)
+
+        kept.append(coords[-1])
+
+        # дополнительная очистка дублей
+        cleaned = [kept[0]]
+        for pt in kept[1:]:
+            if pt != cleaned[-1]:
+                cleaned.append(pt)
+
+        if len(cleaned) < 2:
+            return line
+
+        return LineString(cleaned)
+
+    def _simplify_main_geometries(
+        self,
+        main_geometries: list[LineString],
+        original_points: list[Point],
+        intersection_points: list[Point],
+    ) -> list[LineString]:
+        self.log.info(
+            f"Simplifying main coastline using original vertices and intersections"
+        )
+
+        merged = linemerge(main_geometries)
+
+        if isinstance(merged, LineString):
+            lines = [merged]
+        elif isinstance(merged, MultiLineString):
+            lines = list(merged.geoms)
+        else:
+            lines = main_geometries
+
+        original_union = unary_union(original_points) if original_points else None
+        intersection_union = unary_union(intersection_points) if intersection_points else None
+
+        simplified: list[LineString] = []
+        for line in lines:
+            s = self._simplify_linestring_by_anchors(
+                line=line,
+                original_points_union=original_union,
+                intersection_points_union=intersection_union,
+            )
+            if s is not None and not s.is_empty and len(s.coords) >= 2:
+                simplified.append(s)
+
+        self.log.info(
+            f"Simplified main geometries: {len(main_geometries)} -> {len(simplified)}"
+        )
+        return simplified
 
     # ============================================================
     # Output
@@ -408,24 +512,14 @@ class MainCoastlineBuilder:
     def _build_result(
         self,
         main_component: nx.Graph,
-        trunk_tree: nx.Graph,
         main_edge_keys: set[tuple],
         other_components: list[nx.Graph],
+        original_points: list[Point],
+        intersection_points: list[Point],
         crs,
     ) -> CoastlineBuildResult:
-        """
-        Главное отличие:
-        НЕ склеиваем main в один LineString через line_merge(),
-        потому что на узлах степени 3+ часть трассы визуально теряется.
-        Сохраняем main как набор сегментов.
-        """
         main_geometries: list[LineString] = []
         other_geometries: list[LineString] = []
-
-        trunk_edge_keys = {
-            self._ek(u, v)
-            for u, v in trunk_tree.edges()
-        }
 
         for u, v, data in main_component.edges(data=True):
             ek = self._ek(u, v)
@@ -442,19 +536,32 @@ class MainCoastlineBuilder:
         if not main_geometries:
             raise ValueError("No geometries selected for main coastline")
 
-        main_multiline = MultiLineString(main_geometries)
+        simplified_main = self._simplify_main_geometries(
+            main_geometries=main_geometries,
+            original_points=original_points,
+            intersection_points=intersection_points,
+        )
+
+        if not simplified_main:
+            raise ValueError("Main coastline simplification produced no geometry")
+
+        coastline_geom = (
+            simplified_main[0]
+            if len(simplified_main) == 1
+            else MultiLineString(simplified_main)
+        )
 
         coastline_gdf = gpd.GeoDataFrame(
             [
                 {
                     "role": "main_coastline",
-                    "geometry_type": "MultiLineString",
-                    "segments_count": len(main_geometries),
-                    "length_m": float(sum(g.length for g in main_geometries)),
+                    "geometry_type": coastline_geom.geom_type,
+                    "segments_count": len(simplified_main),
+                    "length_m": float(sum(g.length for g in simplified_main)),
                     "snap_tolerance_m": self.snap_tolerance_m,
-                    "segmentize_step_m": self.segmentize_step_m,
                     "prune_leaf_length_m": self.prune_leaf_length_m,
-                    "geometry": main_multiline,
+                    "angle_tolerance_deg": self.angle_tolerance_deg,
+                    "geometry": coastline_geom,
                 }
             ],
             geometry="geometry",
@@ -467,7 +574,6 @@ class MainCoastlineBuilder:
                     "role": "other_line",
                     "length_m": float(geom.length),
                     "snap_tolerance_m": self.snap_tolerance_m,
-                    "segmentize_step_m": self.segmentize_step_m,
                     "prune_leaf_length_m": self.prune_leaf_length_m,
                     "geometry": geom,
                 }
@@ -483,21 +589,23 @@ class MainCoastlineBuilder:
             other_lines_gdf=other_lines_gdf,
         )
 
+
 if __name__ == "__main__":
     from loguru import logger
 
     builder = MainCoastlineBuilder(
         input_path="../../data/NovorossCoastlineAdded.geojson",
-        # input_path="../../data/NovorossCoastlineVectorS2Coast2023.geojson",
         coastline_output_path="../../data/main_coastline.geojson",
         other_lines_output_path="../../data/other_lines.geojson",
         input_crs="EPSG:4326",
         output_crs="EPSG:4326",
         working_crs=None,
         snap_tolerance_m=3.0,
-        segmentize_step_m=10.0,
         prune_leaf_length_m=80.0,
         prune_iterations=30,
+        angle_tolerance_deg=1.0,
+        keep_intersection_buffer_m=0.05,
+        original_vertex_buffer_m=0.05,
     )
 
     result = builder.build(save=True)

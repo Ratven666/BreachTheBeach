@@ -7,40 +7,23 @@ from src.coastline.exporters.CoastlineExportStrategy import CoastlineExportStrat
 
 class GeoPackageCoastlineExporter(CoastlineExportStrategy):
     """
-    Экспортирует в GeoPackage.
-    Создаются слои:
-    - main_coastline
-    - other_coastline
+    Экспорт линий в один GeoPackage с двумя слоями.
     """
 
     def __init__(
         self,
-        main_layer_name: str = "main_coastline",
-        other_layer_name: str = "other_coastline",
+        main_layer: str = "main_coastline",
+        other_layer: str = "other_coastline",
     ) -> None:
-        self.main_layer_name = main_layer_name
-        self.other_layer_name = other_layer_name
+        self.main_layer = main_layer
+        self.other_layer = other_layer
 
     def export(self, dataset: "CoastlineDataset", output_path: str | Path) -> Path:
-        output_path = Path(output_path)
+        output_path = Path(output_path).with_suffix(".gpkg")
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if output_path.suffix.lower() != ".gpkg":
-            output_path = output_path.with_suffix(".gpkg")
+        dataset.main_gdf.to_file(output_path, layer=self.main_layer, driver="GPKG")
+        dataset.other_gdf.to_file(output_path, layer=self.other_layer, driver="GPKG")
 
-        dataset.main_gdf.to_file(
-            output_path,
-            layer=self.main_layer_name,
-            driver="GPKG",
-        )
-        dataset.other_gdf.to_file(
-            output_path,
-            layer=self.other_layer_name,
-            driver="GPKG",
-        )
-
-        dataset.log.info(
-            f"GeoPackage exported: path={output_path}, "
-            f"layers=({self.main_layer_name}, {self.other_layer_name})"
-        )
+        dataset._log.info(f"GPKG export: {output_path}")
         return output_path

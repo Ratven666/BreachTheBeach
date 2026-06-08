@@ -213,7 +213,7 @@ if __name__ == "__main__":
         extractor = GeofabrikPbfCoastlineExtractor(
             pbf_path="../../../data/south-fed-district-260607.osm.pbf",
             bbox=bbox,
-            output_path="../../../output/coastline_from_pbf.geojson",
+            output_path="../../../data/NovorossCoastlineOSM.geojson",
             osmium_bin="osmium",
         )
 

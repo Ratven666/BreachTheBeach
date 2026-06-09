@@ -1,78 +1,127 @@
 from __future__ import annotations
 
 import json
-import re
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 from loguru import logger
+from scipy.spatial import cKDTree
 
 
 def _slugify(value: Any) -> str:
     text = str(value).strip()
-    text = re.sub(r"[^\w\-\.]+", "_", text, flags=re.UNICODE)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text or "unknown"
+    safe = []
+    for ch in text:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    result = "".join(safe).strip("_")
+    while "__" in result:
+        result = result.replace("__", "_")
+    return result or "unknown"
+
+
+@dataclass(slots=True)
+class WeatherCollection:
+    crs: Any
+    dates: np.ndarray               # shape (T,)
+    speed: np.ndarray               # shape (N, T), float32
+    direction: np.ndarray           # shape (N, T), float32
+    point_ids: np.ndarray           # shape (N,)
+    lat: np.ndarray                 # shape (N,)
+    lon: np.ndarray                 # shape (N,)
+    req_lat: np.ndarray             # shape (N,)
+    req_lon: np.ndarray             # shape (N,)
+    ws_unit: str | None
+    wd_unit: str | None
+    start_date: str | None
+    end_date: str | None
+    metric_crs: Any
+    metric_coords: np.ndarray       # shape (N, 2)
+    tree: cKDTree
 
 
 class WeatherLayerWrapper:
-    def __init__(self, weather_gdf: gpd.GeoDataFrame) -> None:
+    DATE_CANDIDATES = ("dates", "date", "time")
+    WIND_SPEED_CANDIDATES = ("wind_speed", "windspeed", "wind_speed_10m")
+    WIND_DIR_CANDIDATES = ("wind_dir", "wind_direction", "winddir", "wind_direction_10m")
+    LAT_CANDIDATES = ("lat", "latitude")
+    LON_CANDIDATES = ("lon", "longitude")
+    REQ_LAT_CANDIDATES = ("req_lat",)
+    REQ_LON_CANDIDATES = ("req_lon",)
+    WS_UNIT_CANDIDATES = ("ws_unit",)
+    WD_UNIT_CANDIDATES = ("wd_unit",)
+
+    def __init__(self, weather_gdf: gpd.GeoDataFrame, working_crs: str | None = None) -> None:
+        if weather_gdf.empty:
+            raise ValueError("Weather layer is empty")
         if weather_gdf.crs is None:
             raise ValueError("Weather layer has no CRS")
-        self.weather_gdf = weather_gdf
+
+        self.weather_gdf = weather_gdf.copy()
+        self.metric_crs = working_crs or self.weather_gdf.estimate_utm_crs()
+        if self.metric_crs is None:
+            raise ValueError("Failed to determine metric CRS for weather grid")
+
+        self._normalized_weather = self._normalize_weather_grid(self.weather_gdf)
+        self.collection = self._build_weather_collection(self._normalized_weather, self.metric_crs)
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "WeatherLayerWrapper":
+    def from_file(cls, path: str | Path, working_crs: str | None = None) -> "WeatherLayerWrapper":
         gdf = gpd.read_file(path)
         if gdf.empty:
             raise ValueError(f"Weather layer is empty: {path}")
-        return cls(gdf)
+        return cls(gdf, working_crs=working_crs)
 
     def assign_to_points(
-        self,
-        coastline_points_path: str | Path,
-        strategy: str = "nearest",
-        output_geojson_path: str | Path | None = None,
-        output_gpkg_path: str | Path | None = None,
-        output_layer_name: str = "coastline_weather_points",
-        idw_power: float = 2.0,
-        idw_k: int = 4,
-        working_crs: str | None = None,
+            self,
+            coastline_points_path: str | Path,
+            strategy: str = "nearest",
+            output_geojson_path: str | Path | None = None,
+            output_gpkg_path: str | Path | None = None,
+            output_layer_name: str = "coastline_weather_points",
+            idw_power: float = 2.0,
+            idw_k: int = 4,
+            working_crs: str | None = None,
     ) -> gpd.GeoDataFrame:
         coastline_gdf = gpd.read_file(coastline_points_path)
+
         if coastline_gdf.empty:
             raise ValueError(f"Coastline points layer is empty: {coastline_points_path}")
         if coastline_gdf.crs is None:
             raise ValueError("Coastline points layer has no CRS")
 
         result = coastline_gdf.copy()
-
         if "point_id" not in result.columns:
             result["point_id"] = [f"point_{i:05d}" for i in range(len(result))]
 
-        weather_index_fields = []
-        for field in ("grid_lat", "grid_lon", "latitude", "longitude"):
-            if field in self.weather_gdf.columns:
-                weather_index_fields.append(field)
+        collection = self.collection
 
-        result["weather_strategy"] = strategy
-        result["weather_records_count"] = 0
-        result["weather_source_point_count"] = len(self.weather_gdf)
+        if working_crs is not None and str(working_crs) != str(self.collection.metric_crs):
+            logger.info(f"Rebuilding weather collection for working CRS: {working_crs}")
+            collection = self._build_weather_collection(self._normalized_weather, working_crs)
 
         if strategy == "nearest":
-            assigned = self._assign_nearest(result, self.weather_gdf, working_crs=working_crs)
+            assigned = self._assign_nearest_vectorized(result, collection=collection)
         elif strategy == "idw":
-            assigned = self._assign_idw(
+            assigned = self._assign_idw_vectorized(
                 result,
-                self.weather_gdf,
-                working_crs=working_crs,
-                power=idw_power,
+                collection=collection,
                 k=idw_k,
+                power=idw_power,
             )
         else:
             raise ValueError(f"Unsupported assignment strategy: {strategy}")
+
+        assigned["weather_strategy"] = strategy
+        assigned["weather_source_point_count"] = len(collection.point_ids)
+        assigned["weather_records_count"] = len(collection.dates)
 
         if output_geojson_path is not None:
             output_geojson_path = Path(output_geojson_path)
@@ -113,16 +162,17 @@ class WeatherLayerWrapper:
 
         exported_files: list[Path] = []
 
-        for _, point_row in assigned_gdf.iterrows():
-            point_id = point_row[id_column]
+        for row in assigned_gdf.itertuples(index=False):
+            point_id = getattr(row, id_column)
             point_slug = _slugify(point_id)
 
             point_dir = output_dir / point_slug
             point_dir.mkdir(parents=True, exist_ok=True)
 
-            point_weather_gdf = self._build_point_weather_rows(
-                point_row=point_row,
+            point_weather_gdf = self._build_point_weather_rows_from_namedtuple(
+                row=row,
                 point_id=point_id,
+                output_crs=assigned_gdf.crs,
             )
 
             out_path = point_dir / f"{point_slug}.geojson"
@@ -134,212 +184,360 @@ class WeatherLayerWrapper:
             "files_count": len(exported_files),
             "files": [str(path.relative_to(output_dir)) for path in exported_files],
         }
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
         logger.success(f"Per-point weather files exported: {len(exported_files)}")
         return exported_files
 
-    def _assign_nearest(
+    def export_all_points_weather(
         self,
-        coastline_gdf: gpd.GeoDataFrame,
-        weather_gdf: gpd.GeoDataFrame,
-        working_crs: str | None = None,
+        assigned_gdf: gpd.GeoDataFrame,
+        output_path: str | Path,
+        driver: str = "GeoJSON",
+        layer_name: str = "all_points_weather",
+        coast_id_column: str = "point_id",
     ) -> gpd.GeoDataFrame:
-        left = coastline_gdf.copy()
-        right = weather_gdf.copy()
-
-        metric_crs = working_crs or left.estimate_utm_crs()
-        if metric_crs is None:
-            raise ValueError("Failed to determine metric CRS for nearest assignment")
-
-        left_metric = left.to_crs(metric_crs)
-        right_metric = right.to_crs(metric_crs)
-
-        joined = gpd.sjoin_nearest(
-            left_metric,
-            right_metric,
-            how="left",
-            distance_col="weather_distance_m",
+        compact_gdf = self._build_compact_all_points_weather_gdf(
+            assigned_gdf=assigned_gdf,
+            coast_id_column=coast_id_column,
         )
 
-        if "index_right" in joined.columns:
-            joined = joined.drop(columns=["index_right"])
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        joined = joined.to_crs(left.crs)
-        return joined
+        if output_path.suffix.lower() == ".gpkg" or driver.upper() == "GPKG":
+            compact_gdf.to_file(output_path, driver="GPKG", layer=layer_name, index=False)
+        else:
+            compact_gdf.to_file(output_path, driver=driver, index=False)
 
-    def _assign_idw(
-        self,
-        coastline_gdf: gpd.GeoDataFrame,
-        weather_gdf: gpd.GeoDataFrame,
-        working_crs: str | None = None,
-        power: float = 2.0,
-        k: int = 4,
+        logger.success(f"All-points compact weather file written: {output_path}")
+        return compact_gdf
+
+    def _assign_nearest_vectorized(
+            self,
+            coastline_gdf: gpd.GeoDataFrame,
+            collection: WeatherCollection | None = None,
     ) -> gpd.GeoDataFrame:
-        left = coastline_gdf.copy()
-        right = weather_gdf.copy()
+        collection = collection or self.collection
 
-        metric_crs = working_crs or left.estimate_utm_crs()
-        if metric_crs is None:
-            raise ValueError("Failed to determine metric CRS for IDW assignment")
+        left_metric = coastline_gdf.to_crs(collection.metric_crs)
+        left_coords = np.column_stack([left_metric.geometry.x.to_numpy(), left_metric.geometry.y.to_numpy()])
 
-        left_metric = left.to_crs(metric_crs)
-        right_metric = right.to_crs(metric_crs)
+        distances, indices = collection.tree.query(left_coords, k=1)
+        distances = np.asarray(distances).reshape(-1)
+        indices = np.asarray(indices).reshape(-1)
 
-        if right_metric.empty:
-            raise ValueError("Weather grid is empty")
+        result = coastline_gdf.copy()
 
-        right_xy = pd.DataFrame(
-            {
-                "x": right_metric.geometry.x,
-                "y": right_metric.geometry.y,
-            },
-            index=right_metric.index,
+        result["source_grid_point_id"] = collection.point_ids[indices]
+        result["source_lat"] = collection.lat[indices]
+        result["source_lon"] = collection.lon[indices]
+        result["source_req_lat"] = collection.req_lat[indices]
+        result["source_req_lon"] = collection.req_lon[indices]
+        result["weather_distance_m"] = distances.astype(float)
+        result["dates"] = [collection.dates.tolist() for _ in range(len(result))]
+        result["wind_speed"] = [collection.speed[i].astype(float).tolist() for i in indices]
+        result["wind_dir"] = [collection.direction[i].astype(float).tolist() for i in indices]
+        result["ws_unit"] = collection.ws_unit
+        result["wd_unit"] = collection.wd_unit
+        result["start_date"] = collection.start_date
+        result["end_date"] = collection.end_date
+
+        return result
+
+    def _assign_idw_vectorized(
+            self,
+            coastline_gdf: gpd.GeoDataFrame,
+            k: int = 4,
+            power: float = 2.0,
+            collection: WeatherCollection | None = None,
+    ) -> gpd.GeoDataFrame:
+        collection = collection or self.collection
+
+        left_metric = coastline_gdf.to_crs(collection.metric_crs)
+        left_coords = np.column_stack([left_metric.geometry.x.to_numpy(), left_metric.geometry.y.to_numpy()])
+
+        k_eff = min(max(1, int(k)), len(collection.point_ids))
+        distances, indices = collection.tree.query(left_coords, k=k_eff)
+
+        if k_eff == 1:
+            distances = np.asarray(distances).reshape(-1, 1)
+            indices = np.asarray(indices).reshape(-1, 1)
+        else:
+            distances = np.asarray(distances)
+            indices = np.asarray(indices)
+
+        exact_mask = np.min(distances, axis=1) <= 1e-9
+
+        weights = 1.0 / np.maximum(distances, 1e-9) ** float(power)
+        weights_sum = np.sum(weights, axis=1, keepdims=True)
+        weights = weights / weights_sum
+
+        neighbor_speed = collection.speed[indices]
+        neighbor_dir = collection.direction[indices]
+        w3 = weights[:, :, None]
+
+        interp_speed = np.sum(neighbor_speed * w3, axis=1)
+
+        ang = np.deg2rad(neighbor_dir)
+        sin_sum = np.sum(np.sin(ang) * w3, axis=1)
+        cos_sum = np.sum(np.cos(ang) * w3, axis=1)
+        interp_dir = (np.rad2deg(np.arctan2(sin_sum, cos_sum)) + 360.0) % 360.0
+
+        nearest_idx = indices[:, 0]
+        nearest_dist = distances[:, 0]
+
+        if np.any(exact_mask):
+            exact_rows = np.where(exact_mask)[0]
+            exact_src = nearest_idx[exact_rows]
+            interp_speed[exact_rows, :] = collection.speed[exact_src, :]
+            interp_dir[exact_rows, :] = collection.direction[exact_src, :]
+            nearest_dist[exact_rows] = 0.0
+
+        result = coastline_gdf.copy()
+        result["source_grid_point_id"] = collection.point_ids[nearest_idx]
+        result["source_lat"] = collection.lat[nearest_idx]
+        result["source_lon"] = collection.lon[nearest_idx]
+        result["source_req_lat"] = collection.req_lat[nearest_idx]
+        result["source_req_lon"] = collection.req_lon[nearest_idx]
+        result["weather_distance_m"] = nearest_dist.astype(float)
+        result["idw_k"] = int(k_eff)
+        result["idw_power"] = float(power)
+        result["dates"] = [collection.dates.tolist() for _ in range(len(result))]
+        result["wind_speed"] = [row.astype(float).tolist() for row in interp_speed]
+        result["wind_dir"] = [row.astype(float).tolist() for row in interp_dir]
+        result["ws_unit"] = collection.ws_unit
+        result["wd_unit"] = collection.wd_unit
+        result["start_date"] = collection.start_date
+        result["end_date"] = collection.end_date
+
+        return result
+
+    def _build_weather_collection(
+        self,
+        weather_gdf: gpd.GeoDataFrame,
+        metric_crs: Any,
+    ) -> WeatherCollection:
+        metric_weather = weather_gdf.to_crs(metric_crs)
+        metric_coords = np.column_stack([metric_weather.geometry.x.to_numpy(), metric_weather.geometry.y.to_numpy()])
+        tree = cKDTree(metric_coords)
+
+        dates = np.asarray(weather_gdf.iloc[0]["dates"], dtype=object)
+        speed = np.vstack(weather_gdf["wind_speed"].to_list()).astype(np.float32)
+        direction = np.vstack(weather_gdf["wind_dir"].to_list()).astype(np.float32)
+
+        return WeatherCollection(
+            crs=weather_gdf.crs,
+            dates=dates,
+            speed=speed,
+            direction=direction,
+            point_ids=weather_gdf["grid_point_id"].to_numpy(dtype=object),
+            lat=weather_gdf["lat"].to_numpy(dtype=np.float64),
+            lon=weather_gdf["lon"].to_numpy(dtype=np.float64),
+            req_lat=weather_gdf["req_lat"].to_numpy(dtype=np.float64),
+            req_lon=weather_gdf["req_lon"].to_numpy(dtype=np.float64),
+            ws_unit=weather_gdf.iloc[0].get("ws_unit"),
+            wd_unit=weather_gdf.iloc[0].get("wd_unit"),
+            start_date=weather_gdf.iloc[0].get("start_date"),
+            end_date=weather_gdf.iloc[0].get("end_date"),
+            metric_crs=metric_crs,
+            metric_coords=metric_coords,
+            tree=tree,
         )
 
-        assigned_rows: list[dict[str, Any]] = []
+    def _normalize_weather_grid(self, weather_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        rows: list[dict[str, Any]] = []
 
-        for idx, row in left_metric.iterrows():
-            px = row.geometry.x
-            py = row.geometry.y
+        for idx, row in weather_gdf.iterrows():
+            dates = self._extract_list_field(row, self.DATE_CANDIDATES)
+            wind_speed = self._extract_list_field(row, self.WIND_SPEED_CANDIDATES)
+            wind_dir = self._extract_list_field(row, self.WIND_DIR_CANDIDATES)
 
-            distances = ((right_xy["x"] - px) ** 2 + (right_xy["y"] - py) ** 2) ** 0.5
-            nearest_idx = distances.nsmallest(min(k, len(distances))).index
+            if not dates:
+                raise ValueError(f"Weather row {idx} does not contain dates")
+            if not wind_speed:
+                raise ValueError(f"Weather row {idx} does not contain wind_speed")
+            if not wind_dir:
+                raise ValueError(f"Weather row {idx} does not contain wind_dir")
+            if not (len(dates) == len(wind_speed) == len(wind_dir)):
+                raise ValueError(
+                    f"Weather row {idx} has inconsistent array lengths: "
+                    f"dates={len(dates)}, wind_speed={len(wind_speed)}, wind_dir={len(wind_dir)}"
+                )
 
-            nearest = right.loc[nearest_idx].copy()
-            nearest_dist = distances.loc[nearest_idx]
+            normalized = row.drop(labels="geometry").to_dict()
+            normalized["geometry"] = row.geometry
+            normalized["grid_point_id"] = row.get("point_id", idx)
+            normalized["lat"] = self._extract_scalar_field(row, self.LAT_CANDIDATES)
+            normalized["lon"] = self._extract_scalar_field(row, self.LON_CANDIDATES)
+            normalized["req_lat"] = self._extract_scalar_field(row, self.REQ_LAT_CANDIDATES)
+            normalized["req_lon"] = self._extract_scalar_field(row, self.REQ_LON_CANDIDATES)
+            normalized["dates"] = [self._to_date_string(v) for v in dates]
+            normalized["wind_speed"] = [self._safe_float(v) for v in wind_speed]
+            normalized["wind_dir"] = [self._normalize_angle(v) for v in wind_dir]
+            normalized["ws_unit"] = self._extract_scalar_field(row, self.WS_UNIT_CANDIDATES)
+            normalized["wd_unit"] = self._extract_scalar_field(row, self.WD_UNIT_CANDIDATES)
+            normalized["start_date"] = row.get("start_date")
+            normalized["end_date"] = row.get("end_date")
 
-            weights = 1.0 / nearest_dist.clip(lower=1e-9).pow(power)
-            weights = weights / weights.sum()
+            rows.append(normalized)
 
-            result_row = row.drop(labels="geometry").to_dict()
-            result_row["geometry"] = coastline_gdf.loc[idx].geometry
-            result_row["weather_distance_m"] = float(nearest_dist.min())
-            result_row["idw_k"] = int(len(nearest))
-            result_row["idw_power"] = float(power)
+        return gpd.GeoDataFrame(rows, geometry="geometry", crs=weather_gdf.crs)
 
-            for col in nearest.columns:
-                if col == "geometry":
-                    continue
-
-                sample_value = nearest.iloc[0][col]
-
-                if self._is_scalar_series(nearest[col]):
-                    try:
-                        result_row[col] = self._weighted_pick_or_average(nearest[col], weights)
-                    except Exception:
-                        result_row[col] = sample_value
-
-            assigned_rows.append(result_row)
-
-        assigned = gpd.GeoDataFrame(assigned_rows, geometry="geometry", crs=coastline_gdf.crs)
-        return assigned
-
-    def _build_point_weather_rows(
+    def _build_compact_all_points_weather_gdf(
         self,
-        point_row: pd.Series,
+        assigned_gdf: gpd.GeoDataFrame,
+        coast_id_column: str = "point_id",
+    ) -> gpd.GeoDataFrame:
+        rows: list[dict[str, Any]] = []
+
+        for row in assigned_gdf.itertuples(index=False):
+            row_dict = row._asdict()
+            rows.append(
+                {
+                    "point_id": row_dict.get(coast_id_column),
+                    "source_grid_point_id": row_dict.get("source_grid_point_id"),
+                    "weather_strategy": row_dict.get("weather_strategy"),
+                    "weather_distance_m": row_dict.get("weather_distance_m"),
+                    "idw_k": row_dict.get("idw_k"),
+                    "idw_power": row_dict.get("idw_power"),
+                    "source_lat": row_dict.get("source_lat"),
+                    "source_lon": row_dict.get("source_lon"),
+                    "source_req_lat": row_dict.get("source_req_lat"),
+                    "source_req_lon": row_dict.get("source_req_lon"),
+                    "start_date": row_dict.get("start_date"),
+                    "end_date": row_dict.get("end_date"),
+                    "dates": row_dict.get("dates"),
+                    "wind_speed": row_dict.get("wind_speed"),
+                    "wind_dir": row_dict.get("wind_dir"),
+                    "ws_unit": row_dict.get("ws_unit"),
+                    "wd_unit": row_dict.get("wd_unit"),
+                    "weather_records_count": row_dict.get("weather_records_count"),
+                    "geometry": row_dict.get("geometry"),
+                }
+            )
+
+        return gpd.GeoDataFrame(rows, geometry="geometry", crs=assigned_gdf.crs)
+
+    def _build_point_weather_rows_from_namedtuple(
+        self,
+        row: Any,
         point_id: Any,
+        output_crs: Any = "EPSG:4326",
     ) -> gpd.GeoDataFrame:
-        geometry = point_row.geometry
+        row_dict = row._asdict()
+        geometry = row_dict["geometry"]
+        dates = row_dict.get("dates") or []
+        wind_speed = row_dict.get("wind_speed") or []
+        wind_dir = row_dict.get("wind_dir") or []
 
-        weather_payload = None
-        for candidate in ("weather_timeseries", "timeseries", "weather_daily", "daily_json"):
-            if candidate in point_row.index and pd.notna(point_row[candidate]):
-                weather_payload = point_row[candidate]
-                break
-
-        records = self._parse_weather_payload(weather_payload)
-
-        if not records:
-            row = {
+        if not dates:
+            empty_row = {
                 "point_id": point_id,
                 "row_no": 0,
                 "date": None,
+                "wind_speed": None,
+                "wind_direction": None,
+                "ws_unit": row_dict.get("ws_unit"),
+                "wd_unit": row_dict.get("wd_unit"),
+                "weather_strategy": row_dict.get("weather_strategy"),
+                "weather_distance_m": row_dict.get("weather_distance_m"),
                 "geometry": geometry,
             }
-            return gpd.GeoDataFrame([row], geometry="geometry", crs="EPSG:4326")
+            return gpd.GeoDataFrame([empty_row], geometry="geometry", crs=output_crs)
 
-        prepared_rows: list[dict[str, Any]] = []
-        for i, record in enumerate(records):
-            new_row = {"point_id": point_id, "row_no": i, "geometry": geometry}
-            new_row.update(record)
-            prepared_rows.append(new_row)
+        records = []
+        n = len(dates)
 
-        return gpd.GeoDataFrame(prepared_rows, geometry="geometry", crs="EPSG:4326")
+        for i in range(n):
+            records.append(
+                {
+                    "point_id": point_id,
+                    "row_no": i,
+                    "date": dates[i] if i < len(dates) else None,
+                    "wind_speed": float(wind_speed[i]) if i < len(wind_speed) and wind_speed[i] is not None else None,
+                    "wind_direction": float(wind_dir[i]) if i < len(wind_dir) and wind_dir[i] is not None else None,
+                    "ws_unit": row_dict.get("ws_unit"),
+                    "wd_unit": row_dict.get("wd_unit"),
+                    "weather_strategy": row_dict.get("weather_strategy"),
+                    "weather_distance_m": row_dict.get("weather_distance_m"),
+                    "geometry": geometry,
+                }
+            )
 
-    @staticmethod
-    def _parse_weather_payload(payload: Any) -> list[dict[str, Any]]:
-        if payload is None:
-            return []
+        return gpd.GeoDataFrame(records, geometry="geometry", crs=output_crs)
 
-        if isinstance(payload, str):
-            payload = payload.strip()
-            if not payload:
-                return []
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                return []
-
-        if isinstance(payload, list):
-            return [item for item in payload if isinstance(item, dict)]
-
-        if not isinstance(payload, dict):
-            return []
-
-        if "records" in payload and isinstance(payload["records"], list):
-            return [item for item in payload["records"] if isinstance(item, dict)]
-
-        if "daily" in payload and isinstance(payload["daily"], dict):
-            daily = payload["daily"]
-            time_values = daily.get("time", [])
-            variable_names = [k for k in daily.keys() if k != "time"]
-
-            records: list[dict[str, Any]] = []
-            for i, dt in enumerate(time_values):
-                rec = {"date": dt}
-                for var_name in variable_names:
-                    values = daily.get(var_name, [])
-                    rec[var_name] = values[i] if i < len(values) else None
-                records.append(rec)
-            return records
-
-        if "hourly" in payload and isinstance(payload["hourly"], dict):
-            hourly = payload["hourly"]
-            time_values = hourly.get("time", [])
-            variable_names = [k for k in hourly.keys() if k != "time"]
-
-            records = []
-            for i, dt in enumerate(time_values):
-                rec = {"time": dt}
-                for var_name in variable_names:
-                    values = hourly.get(var_name, [])
-                    rec[var_name] = values[i] if i < len(values) else None
-                records.append(rec)
-            return records
-
+    def _extract_list_field(self, row: pd.Series, candidates: tuple[str, ...]) -> list[Any]:
+        for name in candidates:
+            if name in row.index:
+                value = self._to_list(row[name])
+                if value:
+                    return value
         return []
 
-    @staticmethod
-    def _is_scalar_series(series: pd.Series) -> bool:
-        non_null = series.dropna()
-        if non_null.empty:
-            return True
-        sample = non_null.iloc[0]
-        return isinstance(sample, (int, float, str, bool)) and not isinstance(sample, (dict, list, tuple))
+    def _extract_scalar_field(self, row: pd.Series, candidates: tuple[str, ...]) -> Any:
+        for name in candidates:
+            if name in row.index:
+                value = row[name]
+                if not self._is_missing(value):
+                    return value
+        return None
 
     @staticmethod
-    def _weighted_pick_or_average(series: pd.Series, weights: pd.Series) -> Any:
-        non_null = series.dropna()
-        if non_null.empty:
+    def _to_list(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        try:
+            if pd.isna(value):
+                return []
+        except Exception:
+            pass
+        return list(value) if hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict)) else []
+
+    @staticmethod
+    def _is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        try:
+            return bool(pd.isna(value))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except Exception:
             return None
 
-        sample = non_null.iloc[0]
-        if isinstance(sample, (int, float)):
-            aligned_weights = weights.loc[non_null.index]
-            return float((non_null.astype(float) * aligned_weights).sum())
+    @staticmethod
+    def _normalize_angle(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            angle = float(value) % 360.0
+            if angle < 0:
+                angle += 360.0
+            return angle
+        except Exception:
+            return None
 
-        return non_null.iloc[0]
+    @staticmethod
+    def _to_date_string(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None

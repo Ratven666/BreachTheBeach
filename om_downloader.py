@@ -31,7 +31,7 @@ def main() -> None:
     coastline_weather_gpkg_path = output_dir / "coastline_points_with_weather.gpkg"
     coastline_weather_per_point_dir = output_dir / "coastline_weather_points_rows"
 
-    weather_start_date = "2019-01-01"
+    weather_start_date = "1970-01-01"
     weather_end_date = "2025-12-31"
 
     assignment_strategy = "idw"   # "nearest" | "idw"

@@ -8,11 +8,11 @@ import geopandas as gpd
 from loguru import logger
 from shapely.geometry import Point
 
-from .cache import WeatherCache
-from .config import WeatherDownloadConfig
-from .geojson_grid import GeoJsonGridBuilder
+from .WeatherCache import WeatherCache
+from .WeatherDownloadConfig import WeatherDownloadConfig
+from .GeoJsonGridBuilder import GeoJsonGridBuilder
 from .models import GridPoint, WeatherRequest
-from .open_meteo_client import OpenMeteoArchiveClient
+from .OpenMeteoArchiveClient import OpenMeteoArchiveClient
 
 
 class WeatherHistoryService:

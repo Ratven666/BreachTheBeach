@@ -8,8 +8,11 @@ from src.coastline.domain import CoastlineDataset
 from src.coastline.exporters import GeoJsonPointExporter
 from src.coastline.point_strategies import EqualRadiusStrategy, PointSource
 from src.coastline.services import CoastlinePointExtractor
-from src.weather_history.assignment import WeatherLayerWrapper
-from src.weather_history.wheather_downloaders.open_meteo import WeatherHistoryService, WeatherDownloadConfig
+from src.weather_history.WeatherLayerWrapper import WeatherLayerWrapper
+from src.weather_history.wheather_downloaders.open_meteo import (
+    WeatherDownloadConfig,
+    WeatherHistoryService,
+)
 
 
 def main() -> None:
@@ -23,8 +26,10 @@ def main() -> None:
 
     radius_points_geojson_path = output_dir / "novoross_main_radius_points.geojson"
     weather_grid_geojson_path = output_dir / "weather_daily_grid.geojson"
+
     coastline_weather_geojson_path = output_dir / "coastline_points_with_weather.geojson"
     coastline_weather_gpkg_path = output_dir / "coastline_points_with_weather.gpkg"
+    coastline_weather_per_point_dir = output_dir / "coastline_weather_points_rows"
 
     weather_start_date = "2019-01-01"
     weather_end_date = "2025-12-31"
@@ -119,8 +124,18 @@ def main() -> None:
 
     logger.info(f"Assigned strategy: {assignment_strategy}")
     logger.info(f"Assigned coastline points count: {len(assigned_gdf)}")
-    logger.success(f"Assigned coastline weather GeoJSON: {coastline_weather_geojson_path}")
-    logger.success(f"Assigned coastline weather GPKG: {coastline_weather_gpkg_path}")
+    logger.success(f"Assignment GeoJSON saved: {coastline_weather_geojson_path}")
+    logger.success(f"Assignment GPKG saved: {coastline_weather_gpkg_path}")
+
+    exported_files = weather_wrapper.export_point_files(
+        assigned_gdf=assigned_gdf,
+        output_dir=coastline_weather_per_point_dir,
+        coast_id_column="point_id",  # если такого поля нет, метод сам сделает fallback
+        driver="GeoJSON",
+    )
+
+    logger.info(f"Per-point files count: {len(exported_files)}")
+    logger.success(f"Per-point directory saved: {coastline_weather_per_point_dir}")
     logger.success("Pipeline completed successfully.")
 
 

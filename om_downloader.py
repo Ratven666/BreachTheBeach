@@ -8,7 +8,8 @@ from src.coastline.domain import CoastlineDataset
 from src.coastline.exporters import GeoJsonPointExporter
 from src.coastline.point_strategies import EqualRadiusStrategy, PointSource
 from src.coastline.services import CoastlinePointExtractor
-from src.weather_history.WeatherLayerWrapper import WeatherLayerWrapper
+from src.weather_history.domain import WeatherLayerWrapper
+
 from src.weather_history.wheather_downloaders.open_meteo import (
     WeatherDownloadConfig,
     WeatherHistoryService,
@@ -31,7 +32,7 @@ def main() -> None:
     coastline_weather_gpkg_path = output_dir / "coastline_points_with_weather.gpkg"
     coastline_weather_per_point_dir = output_dir / "coastline_weather_points_rows"
 
-    weather_start_date = "1948-01-01"
+    weather_start_date = "1947-01-01"
     weather_end_date = "2025-12-31"
 
     assignment_strategy = "idw"   # "nearest" | "idw"

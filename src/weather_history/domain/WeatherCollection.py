@@ -10,20 +10,20 @@ from scipy.spatial import cKDTree
 @dataclass(slots=True)
 class WeatherCollection:
     crs: Any
-    dates: np.ndarray                 # (T,)
-    speed: np.ndarray                 # (N, T)
-    direction: np.ndarray             # (N, T)
-    point_ids: np.ndarray             # (N,)
-    lat: np.ndarray                   # (N,)
-    lon: np.ndarray                   # (N,)
-    req_lat: np.ndarray               # (N,)
-    req_lon: np.ndarray               # (N,)
+    dates: np.ndarray
+    speed: np.ndarray
+    direction: np.ndarray
+    point_ids: np.ndarray
+    lat: np.ndarray
+    lon: np.ndarray
+    req_lat: np.ndarray
+    req_lon: np.ndarray
     ws_unit: str | None
     wd_unit: str | None
     start_date: str | None
     end_date: str | None
     metric_crs: Any
-    metric_coords: np.ndarray         # (N, 2)
+    metric_coords: np.ndarray
     tree: cKDTree
 
     @property

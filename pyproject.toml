@@ -21,6 +21,7 @@ numpy = "^2.4.6"
 pandas = "^3.0.3"
 cfgrib = "^0.9.15.1"
 scipy = "^1.17.1"
+plotly = "^6.8.0"
 
 
 [build-system]

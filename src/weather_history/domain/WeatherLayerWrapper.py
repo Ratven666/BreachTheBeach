@@ -12,11 +12,7 @@ from shapely.geometry import Point
 
 from src.weather_history.domain.WeatherCollection import WeatherCollection
 from src.weather_history.domain.WeatherPoint import WeatherPoint
-from src.weather_history.services.weather_file_exporter import (
-    export_gdf,
-    slugify,
-    write_manifest,
-)
+from src.weather_history.services.weather_file_exporter import export_gdf, slugify, write_manifest
 
 
 class WeatherLayerWrapper:

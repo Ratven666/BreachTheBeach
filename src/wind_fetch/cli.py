@@ -7,7 +7,7 @@ from loguru import logger
 
 from .WindFetchConfig import WindFetchConfig
 from .WindFetchCalculator import WindFetchCalculator
-from .WindFetchResult import WindFetchPaths
+from .models import WindFetchPaths
 from .WindFetchVisualizer import WindFetchVisualizer
 
 

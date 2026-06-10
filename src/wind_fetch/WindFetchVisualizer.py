@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from loguru import logger
 
 from .WindFetchCalculator import WindFetchCalculator
-from .WindFetchResult import WindFetchResult
+from .models import WindFetchResult
 
 
 class WindFetchVisualizer:

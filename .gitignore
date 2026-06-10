@@ -232,3 +232,5 @@ secret/
 .DS_Store
 
 test.py
+
+coastliту_simlifier_test.py

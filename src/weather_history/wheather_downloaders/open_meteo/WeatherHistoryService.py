@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import geopandas as gpd
@@ -35,10 +35,15 @@ class WeatherHistoryService:
         end_date: str,
         daily_variables: tuple[str, ...] | None = None,
     ) -> WeatherRequest:
-        return WeatherRequest(
-            geojson_path=Path(geojson_path),
+        normalized_start, normalized_end = self._normalize_requested_range(
             start_date=start_date,
             end_date=end_date,
+        )
+
+        return WeatherRequest(
+            geojson_path=Path(geojson_path),
+            start_date=normalized_start,
+            end_date=normalized_end,
             daily_variables=daily_variables or self.config.daily_variables,
         )
 
@@ -67,6 +72,9 @@ class WeatherHistoryService:
         logger.info(
             f"Coverage mode: cells_cover_points={self.config.cover_points_with_cells}, "
             f"extra_border_cells={self.config.extra_border_cells}"
+        )
+        logger.info(
+            f"Effective weather period: {request.start_date}..{request.end_date}"
         )
 
         point_missing_ranges: dict[tuple[float, float, int, int], list[tuple[str, str]]] = {}
@@ -177,6 +185,8 @@ class WeatherHistoryService:
             "weather_bbox": weather_bbox,
             "grid_points_count": len(grid_points),
             "download_tasks_count": len(all_download_tasks),
+            "effective_start_date": request.start_date,
+            "effective_end_date": request.end_date,
             "output_geojson_path": str(output_geojson),
         }
 
@@ -233,6 +243,46 @@ class WeatherHistoryService:
 
         return gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
 
+    def _normalize_requested_range(self, start_date: str, end_date: str) -> tuple[str, str]:
+        requested_start = self._parse_date(start_date)
+        requested_end = self._parse_date(end_date)
+
+        if requested_start > requested_end:
+            raise ValueError(
+                f"Invalid date range: start_date={start_date} is after end_date={end_date}"
+            )
+
+        if self.config.archive_lag_days < 0:
+            raise ValueError(
+                f"archive_lag_days must be >= 0, got {self.config.archive_lag_days}"
+            )
+
+        min_allowed = self._parse_date(self.config.archive_min_date)
+        current_utc_date = datetime.now(UTC).date()
+        max_allowed = current_utc_date - timedelta(days=self.config.archive_lag_days)
+
+        normalized_start = max(requested_start, min_allowed)
+        normalized_end = min(requested_end, max_allowed)
+
+        if (normalized_start, normalized_end) != (requested_start, requested_end):
+            logger.warning(
+                f"Requested weather range adjusted from "
+                f"{requested_start.isoformat()}..{requested_end.isoformat()} to "
+                f"{normalized_start.isoformat()}..{normalized_end.isoformat()} "
+                f"(lag_days={self.config.archive_lag_days})"
+            )
+
+        if normalized_start > normalized_end:
+            raise ValueError(
+                "Requested range is outside historical archive coverage. "
+                f"Allowed range: {min_allowed.isoformat()}..{max_allowed.isoformat()} "
+                f"(current_utc_date={current_utc_date.isoformat()}, "
+                f"lag_days={self.config.archive_lag_days}), "
+                f"requested: {requested_start.isoformat()}..{requested_end.isoformat()}"
+            )
+
+        return normalized_start.isoformat(), normalized_end.isoformat()
+
     def _get_missing_ranges_for_point(
         self,
         point: GridPoint,
@@ -258,7 +308,6 @@ class WeatherHistoryService:
         daily_variables: tuple[str, ...],
     ) -> set[date]:
         covered: set[date] = set()
-        required_vars = set(daily_variables)
         request_start = self._parse_date(start_date)
         request_end = self._parse_date(end_date)
 
@@ -276,22 +325,8 @@ class WeatherHistoryService:
                 continue
 
             payload = self.cache.load_segment_by_key(meta["cache_key"])
-            daily = payload.get("daily", {})
-            times = daily.get("time", [])
-
-            if not times:
-                continue
-
-            available_vars = {
-                key for key, value in daily.items()
-                if key != "time" and isinstance(value, list)
-            }
-            if not required_vars.issubset(available_vars):
-                continue
-
-            valid_days = self._extract_valid_dates_from_payload(
+            valid_days = self._extract_cached_dates_from_payload(
                 payload=payload,
-                daily_variables=daily_variables,
                 request_start=request_start,
                 request_end=request_end,
             )
@@ -299,44 +334,22 @@ class WeatherHistoryService:
 
         return covered
 
-    def _extract_valid_dates_from_payload(
+    def _extract_cached_dates_from_payload(
         self,
         payload: dict,
-        daily_variables: tuple[str, ...],
         request_start: date,
         request_end: date,
     ) -> set[date]:
         daily = payload.get("daily", {})
         times = daily.get("time", [])
-        if not times:
-            return set()
 
-        values_by_var: dict[str, list] = {
-            variable: daily.get(variable, [])
-            for variable in daily_variables
-        }
-
-        valid_dates: set[date] = set()
-
-        for idx, raw_day in enumerate(times):
+        result: set[date] = set()
+        for raw_day in times:
             day = self._parse_date(raw_day)
-            if day < request_start or day > request_end:
-                continue
+            if request_start <= day <= request_end:
+                result.add(day)
 
-            is_complete = True
-            for variable in daily_variables:
-                values = values_by_var.get(variable, [])
-                if idx >= len(values):
-                    is_complete = False
-                    break
-                if values[idx] is None:
-                    is_complete = False
-                    break
-
-            if is_complete:
-                valid_dates.add(day)
-
-        return valid_dates
+        return result
 
     def _merge_cached_payloads_for_period(
         self,
@@ -386,17 +399,17 @@ class WeatherHistoryService:
 
                 for variable in daily_variables:
                     values = daily.get(variable, [])
-                    if idx < len(values) and values[idx] is not None:
-                        per_day[day_key][variable] = values[idx]
+                    value = values[idx] if idx < len(values) else None
+                    per_day[day_key][variable] = value
 
         missing_days = [
             day_key
             for day_key in expected_dates
-            if day_key not in per_day or any(var not in per_day[day_key] for var in daily_variables)
+            if day_key not in per_day
         ]
         if missing_days:
             raise RuntimeError(
-                f"Missing cached daily data for point lat={point.lat}, lon={point.lon}: "
+                f"Missing cached dates for point lat={point.lat}, lon={point.lon}: "
                 f"{missing_days[:10]}{'...' if len(missing_days) > 10 else ''}"
             )
 
@@ -405,7 +418,7 @@ class WeatherHistoryService:
 
         merged_daily = {"time": expected_dates}
         for variable in daily_variables:
-            merged_daily[variable] = [per_day[day_key][variable] for day_key in expected_dates]
+            merged_daily[variable] = [per_day[day_key].get(variable) for day_key in expected_dates]
 
         return {
             "latitude": base.get("latitude", point.lat),
@@ -459,8 +472,7 @@ class WeatherHistoryService:
             key = (task["start_date"], task["end_date"])
             grouped.setdefault(key, []).append(task["point"])
 
-        result = sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1]))
-        return result
+        return sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1]))
 
     @staticmethod
     def _point_key(point: GridPoint) -> tuple[float, float, int, int]:

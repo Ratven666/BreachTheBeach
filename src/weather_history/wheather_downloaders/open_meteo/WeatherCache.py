@@ -91,24 +91,6 @@ class WeatherCache:
         timezone: str,
         cell_selection: str,
     ) -> list[dict]:
-        """
-        Возвращает метаданные всех кэш-сегментов для точки, совместимых по:
-        - model
-        - variables_key
-        - timezone
-        - cell_selection
-
-        Каждый элемент содержит:
-        {
-            "cache_key": "<absolute path to json payload>",
-            "metadata_key": "<absolute path to meta json>",
-            "start_date": "...",
-            "end_date": "...",
-            "daily_variables": [...],
-            "timezone": "...",
-            "cell_selection": "..."
-        }
-        """
         variables_key = self.build_variables_key(daily_variables)
         directory = self.point_dir(point, model)
 
@@ -125,13 +107,10 @@ class WeatherCache:
 
             if metadata.get("model") != model:
                 continue
-
             if metadata.get("variables_key") != variables_key:
                 continue
-
             if metadata.get("timezone") != timezone:
                 continue
-
             if metadata.get("cell_selection") != cell_selection:
                 continue
 

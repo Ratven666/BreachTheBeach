@@ -33,7 +33,7 @@ def main() -> None:
     coastline_weather_per_point_dir = output_dir / "coastline_weather_points_rows"
 
     weather_start_date = "1940-01-01"
-    weather_end_date = "2025-12-31"
+    weather_end_date = "2026-12-31"
 
     assignment_strategy = "idw"   # "nearest" | "idw"
     idw_power = 2.0

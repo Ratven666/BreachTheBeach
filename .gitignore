@@ -226,3 +226,7 @@ output/
 test.py
 
 base_var.py
+
+secret/
+
+.DS_Store

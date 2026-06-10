@@ -191,11 +191,22 @@ if __name__ == "__main__":
 
     from loguru import logger
 
+    # Novorossiysk
+
+    # bbox = BBox(
+    #     south=44.6,
+    #     west=37.7,
+    #     north=44.8,
+    #     east=37.95,
+    # )
+
+    # Black Sea
+
     bbox = BBox(
-        south=44.6,
-        west=37.7,
-        north=44.8,
-        east=37.95,
+        south=40,
+        west=27,
+        north=48,
+        east=42,
     )
 
     try:
@@ -205,7 +216,8 @@ if __name__ == "__main__":
         extractor = VectorCoastlineExtractor(
             vector_path="../../../data/S2Coast2023_ShapeFile_vector/S2Coast-2023_Polyline_diss.shp",
             bbox=bbox,
-            output_path="../../../data/NovorossCoastlineVectorS2Coast2023.geojson",
+            # output_path="../../../data/NovorossCoastlineVectorS2Coast2023.geojson",
+            output_path="../../../data/BlackSeaCoastlineS2Coast2023.geojson",
             layer=None,
             coastline_field="natural",
             coastline_value="coastline",

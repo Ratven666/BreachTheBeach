@@ -594,9 +594,12 @@ if __name__ == "__main__":
     from loguru import logger
 
     builder = MainCoastlineBuilder(
-        input_path="../../data/NovorossCoastlineAdded.geojson",
-        coastline_output_path="../../data/main_coastline.geojson",
-        other_lines_output_path="../../data/other_lines.geojson",
+        # input_path="../../data/NovorossCoastlineAdded.geojson",
+        input_path="../../../data/BlackSeaCoastlineS2Coast2023.geojson",
+        # coastline_output_path="../../data/main_coastline.geojson",
+        coastline_output_path="../../../data/black_sea_main_coastline.geojson",
+        # other_lines_output_path="../../data/other_lines.geojson",
+        other_lines_output_path="../../../data/black_sea_other_lines.geojson",
         input_crs="EPSG:4326",
         output_crs="EPSG:4326",
         working_crs=None,

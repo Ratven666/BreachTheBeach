@@ -223,10 +223,12 @@ data/
 
 output/
 
-test.py
+coasline_dataset_merger.py
 
 base_var.py
 
 secret/
 
 .DS_Store
+
+test.py

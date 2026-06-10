@@ -202,12 +202,22 @@ if __name__ == "__main__":
 
     # Black Sea
 
+    # bbox = BBox(
+    #     south=40,
+    #     west=27,
+    #     north=48,
+    #     east=42,
+    # )
+
+    # Black Sea Around NVRSK
+
     bbox = BBox(
-        south=40,
-        west=27,
-        north=48,
-        east=42,
+        south=43,
+        west=36.6,
+        north=45,
+        east=39,
     )
+
 
     try:
         app_log = logger.bind(extractor="main")
@@ -217,7 +227,8 @@ if __name__ == "__main__":
             vector_path="../../../data/S2Coast2023_ShapeFile_vector/S2Coast-2023_Polyline_diss.shp",
             bbox=bbox,
             # output_path="../../../data/NovorossCoastlineVectorS2Coast2023.geojson",
-            output_path="../../../data/BlackSeaCoastlineS2Coast2023.geojson",
+            # output_path="../../../data/BlackSeaCoastlineS2Coast2023.geojson",
+            output_path="../../../data/NVRSK_BlackSeaCoastlineS2Coast2023.geojson",
             layer=None,
             coastline_field="natural",
             coastline_value="coastline",

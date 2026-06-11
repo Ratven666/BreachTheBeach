@@ -9,7 +9,7 @@ from loguru import logger
 
 from src.base.BBox import BBox
 from src.bathymetry.domain.models import BathymetryGrid
-from src.bathymetry.loaders.base import BathymetryLoader
+from src.bathymetry.loaders.BathymetryLoader import BathymetryLoader
 
 # REST-endpoint beta-загрузчика GEBCO (download.gebco.net)
 # Возвращает NetCDF-файл по заданному bbox без аутентификации.

@@ -1,3 +1,3 @@
-from .profile_builder import ProfileBuilder
+from .ProfileBuilder import ProfileBuilder
 
 __all__ = ["ProfileBuilder"]

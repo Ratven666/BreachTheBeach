@@ -1,4 +1,4 @@
-from .grid_plotter import BathymetryGridPlotter
-from .profile_plotter import ProfilePlotter
+from .BathymetryGridPlotter import BathymetryGridPlotter
+from .ProfilePlotter import ProfilePlotter
 
 __all__ = ["BathymetryGridPlotter", "ProfilePlotter"]

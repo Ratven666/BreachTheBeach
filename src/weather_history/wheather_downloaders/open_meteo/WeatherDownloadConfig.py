@@ -18,6 +18,8 @@ class WeatherDownloadConfig:
     batch_size: int = 25
     request_pause_seconds: float = 0.0
     user_agent: str = "BreachTheBeach/0.1.0"
+    archive_min_date: str = "1940-01-01"
+    archive_lag_days: int = 7
     daily_variables: tuple[str, ...] = field(
         default_factory=lambda: (
             "wind_speed_10m_max",

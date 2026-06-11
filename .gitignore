@@ -231,6 +231,10 @@ secret/
 
 .DS_Store
 
-test.py
+multy_ray_trcer_test.py
 
 coastliту_simlifier_test.py
+
+bathymetry_test.py
+
+test.py

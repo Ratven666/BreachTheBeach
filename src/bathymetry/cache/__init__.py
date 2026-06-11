@@ -1,3 +1,3 @@
-from .bathymetry_cache import BathymetryCache
+from .BathymetryCache import BathymetryCache
 
 __all__ = ["BathymetryCache"]

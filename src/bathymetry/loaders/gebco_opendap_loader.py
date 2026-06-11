@@ -9,7 +9,7 @@ from loguru import logger
 from src.base.BBox import BBox
 from src.bathymetry.domain.models import BathymetryGrid
 from src.bathymetry.errors import BathymetryLoadError
-from src.bathymetry.loaders.base import BathymetryLoader
+from src.bathymetry.loaders.BathymetryLoader import BathymetryLoader
 
 _GEBCO_OPENDAP_URL = (
     "https://dap.ceda.ac.uk/thredds/dodsC/neodc/gebco/data/gebco_2025/GEBCO_2025.nc"

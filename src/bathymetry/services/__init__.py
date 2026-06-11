@@ -1,3 +1,3 @@
-from .bathymetry_service import BathymetryService
+from .BathymetryService import BathymetryService
 
 __all__ = ["BathymetryService"]

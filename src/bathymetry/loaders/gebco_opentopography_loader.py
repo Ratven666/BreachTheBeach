@@ -19,7 +19,7 @@ from src.bathymetry.errors import (
     BathymetryNetworkError,
     BathymetryProviderResponseError,
 )
-from src.bathymetry.loaders.base import BathymetryLoader
+from src.bathymetry.loaders.BathymetryLoader import BathymetryLoader
 
 
 class GEBCOOpenTopographyLoader(BathymetryLoader):

@@ -12,7 +12,7 @@ from loguru import logger
 from src.base.BBox import BBox
 from src.bathymetry.domain.models import BathymetryGrid
 from src.bathymetry.errors import BathymetryLoadError
-from src.bathymetry.loaders.base import BathymetryLoader
+from src.bathymetry.loaders.BathymetryLoader import BathymetryLoader
 
 
 class EMODnetBathymetryLoader(BathymetryLoader):

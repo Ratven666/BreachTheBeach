@@ -1,8 +1,8 @@
-from .base import BathymetryLoader
-from .emodnet_loader import EMODnetBathymetryLoader
+from .BathymetryLoader import BathymetryLoader
+from .EMODnetBathymetryLoader import EMODnetBathymetryLoader
 from .gebco_opendap_loader import GEBCOOpenDAPLoader
 from .gebco_opentopography_loader import GEBCOOpenTopographyLoader
-from .local_netcdf_loader import LocalNetCDFBathymetryLoader
+from .LocalNetCDFBathymetryLoader import LocalNetCDFBathymetryLoader
 
 __all__ = [
     "BathymetryLoader",

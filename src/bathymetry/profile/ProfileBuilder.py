@@ -4,7 +4,7 @@ import numpy as np
 from pyproj import Geod
 
 from src.bathymetry.domain.models import BathymetryGrid, BathymetryProfile, GeoLine, GeoPoint
-from src.bathymetry.interpolation.depth_interpolator import DepthInterpolator
+from src.bathymetry.interpolation.DepthInterpolator import DepthInterpolator
 
 _WGS84 = Geod(ellps="WGS84")
 

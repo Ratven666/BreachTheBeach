@@ -11,22 +11,20 @@ from loguru import logger
 
 from src.base.BBox import BBox
 from src.bathymetry.domain.models import BathymetryGrid
-from src.bathymetry.errors import BathymetryLoadError
+from src.bathymetry.errors import (
+    BathymetryConfigurationError,
+    BathymetryDataReadError,
+    BathymetryInvalidApiKeyError,
+    BathymetryMissingApiKeyError,
+    BathymetryNetworkError,
+    BathymetryProviderResponseError,
+)
 from src.bathymetry.loaders.base import BathymetryLoader
 
 
 class GEBCOOpenTopographyLoader(BathymetryLoader):
-    """
-    Загрузчик GEBCO через OpenTopography Global DEM API.
-
-    Использует:
-    - endpoint: https://portal.opentopography.org/API/globaldem
-    - demtype: GEBCOIceTopo
-    - outputFormat: GTiff
-
-    OpenTopography публикует GEBCO через globaldem API, а доступ
-    к hosted global datasets обычно требует API key [web:205][web:207][web:215].
-    """
+    _PROVIDER_NAME = "OpenTopography"
+    _API_KEY_ENV = "OPENTOPOGRAPHY_API_KEY"
 
     def __init__(
         self,
@@ -37,17 +35,22 @@ class GEBCOOpenTopographyLoader(BathymetryLoader):
         output_dir: str | Path | None = None,
         timeout: int = 300,
         save_download: bool = False,
+        require_api_key: bool = True,
     ) -> None:
-        self._api_key = api_key or os.getenv("OPENTOPOGRAPHY_API_KEY")
+        self._api_key = api_key or os.getenv(self._API_KEY_ENV)
         self._base_url = base_url
         self._demtype = demtype
         self._output_dir = Path(output_dir) if output_dir else None
         self._timeout = timeout
         self._save_download = save_download
+        self._require_api_key = require_api_key
         self._log = logger.bind(cls=self.__class__.__name__)
 
         if self._output_dir is not None:
             self._output_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self._base_url:
+            raise BathymetryConfigurationError("OpenTopography base_url must not be empty.")
 
     @property
     def source_name(self) -> str:
@@ -56,13 +59,18 @@ class GEBCOOpenTopographyLoader(BathymetryLoader):
     def load(self, bbox: BBox) -> BathymetryGrid:
         tif_path = self._download_geotiff(bbox)
         try:
-            grid = self._read_geotiff_as_grid(tif_path)
-            return grid
+            return self._read_geotiff_as_grid(tif_path)
         finally:
             if not self._save_download and tif_path.exists():
                 tif_path.unlink(missing_ok=True)
 
     def _download_geotiff(self, bbox: BBox) -> Path:
+        if self._require_api_key and not self._api_key:
+            raise BathymetryMissingApiKeyError(
+                provider=self._PROVIDER_NAME,
+                variable_name=self._API_KEY_ENV,
+            )
+
         params = {
             "demtype": self._demtype,
             "south": bbox.south,
@@ -85,16 +93,39 @@ class GEBCOOpenTopographyLoader(BathymetryLoader):
                 stream=True,
                 timeout=self._timeout,
             )
-        except Exception as e:
-            raise BathymetryLoadError(
-                f"Failed to connect to OpenTopography: {e}"
+        except requests.exceptions.Timeout as e:
+            raise BathymetryNetworkError(
+                f"{self._PROVIDER_NAME} request timed out after {self._timeout} seconds."
+            ) from e
+        except requests.exceptions.ConnectionError as e:
+            raise BathymetryNetworkError(
+                f"Could not connect to {self._PROVIDER_NAME}."
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise BathymetryNetworkError(
+                f"{self._PROVIDER_NAME} request failed: {e}"
             ) from e
 
+        if response.status_code == 401:
+            details = self._extract_error_preview(response)
+            raise BathymetryInvalidApiKeyError(
+                provider=self._PROVIDER_NAME,
+                details=details or "Invalid or expired API key.",
+            )
+
+        if response.status_code == 403:
+            details = self._extract_error_preview(response)
+            raise BathymetryInvalidApiKeyError(
+                provider=self._PROVIDER_NAME,
+                details=details or "Access forbidden for the provided API key.",
+            )
+
         if response.status_code != 200:
-            preview = response.text[:500] if response.text else ""
-            raise BathymetryLoadError(
-                "OpenTopography request failed. "
-                f"HTTP {response.status_code}. Response preview: {preview}"
+            details = self._extract_error_preview(response)
+            raise BathymetryProviderResponseError(
+                provider=self._PROVIDER_NAME,
+                status_code=response.status_code,
+                details=details,
             )
 
         if self._output_dir:
@@ -112,10 +143,10 @@ class GEBCOOpenTopographyLoader(BathymetryLoader):
                     if chunk:
                         f.write(chunk)
             os.replace(part_path, tif_path)
-        except Exception as e:
+        except OSError as e:
             part_path.unlink(missing_ok=True)
-            raise BathymetryLoadError(
-                f"Failed to save OpenTopography GeoTIFF: {e}"
+            raise BathymetryDataReadError(
+                f"Failed to save GeoTIFF downloaded from {self._PROVIDER_NAME}: {e}"
             ) from e
 
         self._log.info(f"OpenTopography GeoTIFF saved to: {tif_path}")
@@ -125,7 +156,7 @@ class GEBCOOpenTopographyLoader(BathymetryLoader):
         try:
             import rasterio
         except ImportError as e:
-            raise BathymetryLoadError(
+            raise BathymetryConfigurationError(
                 "rasterio is required to read OpenTopography GeoTIFF. "
                 "Install it with `poetry add rasterio`."
             ) from e
@@ -154,9 +185,17 @@ class GEBCOOpenTopographyLoader(BathymetryLoader):
                     source=self.source_name,
                 )
         except Exception as e:
-            raise BathymetryLoadError(
-                f"Failed to read OpenTopography GeoTIFF {tif_path}: {e}"
+            raise BathymetryDataReadError(
+                f"Failed to read GeoTIFF from {self._PROVIDER_NAME}: {tif_path}. {e}"
             ) from e
+
+    @staticmethod
+    def _extract_error_preview(response: requests.Response, limit: int = 300) -> str:
+        try:
+            text = response.text.strip()
+        except Exception:
+            return ""
+        return text[:limit]
 
     def _build_filename(self, bbox: BBox) -> str:
         safe_demtype = self._demtype.replace(":", "_")

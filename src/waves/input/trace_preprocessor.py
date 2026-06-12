@@ -19,16 +19,10 @@ class TracePreprocessor:
 
         out = df[[az, dist]].copy()
         out.columns = ["direction", "fetch_m"]
-
         out["direction"] = (
-            pd.to_numeric(out["direction"], errors="coerce")
-            .round()
-            .fillna(0)
-            .astype(int)
-            % 360
+            pd.to_numeric(out["direction"], errors="coerce").round().fillna(0).astype(int) % 360
         )
         out["fetch_m"] = pd.to_numeric(out["fetch_m"], errors="coerce").fillna(0.0)
-
         out = (
             out.groupby("direction", as_index=False)["fetch_m"]
             .max()

@@ -15,12 +15,6 @@ class ShoreNormalEstimator:
         df = trace_df.sort_values("direction")
         fetch = df["fetch_m"].to_numpy(dtype=float)
         directions = df["direction"].to_numpy(dtype=float)
-
-        smooth = (
-            pd.Series(fetch)
-            .rolling(window=window, center=True, min_periods=1)
-            .mean()
-            .to_numpy()
-        )
+        smooth = pd.Series(fetch).rolling(window=window, center=True, min_periods=1).mean().to_numpy()
         idx = int(np.argmax(smooth))
         return float(directions[idx])

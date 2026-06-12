@@ -21,11 +21,14 @@ class FetchLookup:
 
     def get_fetch(self, direction_deg: int) -> float:
         direction_deg = int(direction_deg) % 360
-
         if direction_deg in self._lookup:
             return float(self._lookup[direction_deg])
 
-        idx = int(np.abs(self._directions - direction_deg).argmin())
+        delta = np.minimum(
+            np.abs(self._directions - direction_deg),
+            360 - np.abs(self._directions - direction_deg),
+        )
+        idx = int(delta.argmin())
         nearest = int(self._directions[idx])
         return float(self._lookup[nearest])
 

@@ -13,7 +13,6 @@ class WaveClimateStatistics:
     def cwef_stats(daily: pd.DataFrame, shore_normal_deg: float) -> dict:
         c = daily["CWEF_Wm"]
         n = len(c)
-
         return {
             "shore_normal_deg": round(float(shore_normal_deg), 1),
             "mean_Wm": round(float(c.mean()), 2),
@@ -25,13 +24,13 @@ class WaveClimateStatistics:
             "p99_Wm": round(float(c.quantile(0.99)), 2),
             "max_Wm": round(float(c.max()), 2),
             "n_days": int(n),
-            "n_storm_days_p90": int((c > c.quantile(0.90)).sum()),
+            "n_storm_days_p90": int((c >= c.quantile(0.90)).sum()),
             "total_energy_MJm": round(float(c.sum() * 86400.0 / 1e6), 1),
         }
 
     @staticmethod
     def cwef_by_direction(daily: pd.DataFrame) -> pd.DataFrame:
-        out = (
+        return (
             daily.groupby("direction", as_index=False)
             .agg(
                 mean_CWEF_Wm=("CWEF_Wm", "mean"),
@@ -43,17 +42,12 @@ class WaveClimateStatistics:
             .sort_values("sum_CWEF_Wm", ascending=False)
             .reset_index(drop=True)
         )
-        return out
 
     @classmethod
     def cwef_by_sector(cls, daily: pd.DataFrame) -> pd.DataFrame:
         df = daily.copy()
-        df["sector"] = [
-            cls.SECTOR_LABELS[int((d + 11.25) / 22.5) % 16]
-            for d in df["direction"]
-        ]
+        df["sector"] = [cls.SECTOR_LABELS[int((d + 11.25) / 22.5) % 16] for d in df["direction"]]
         order = {lab: i for i, lab in enumerate(cls.SECTOR_LABELS)}
-
         out = (
             df.groupby("sector", as_index=False)
             .agg(

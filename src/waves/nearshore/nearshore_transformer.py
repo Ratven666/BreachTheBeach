@@ -44,7 +44,6 @@ class NearshoreWaveTransformer:
 
         profile = self._profile_cache[direction_deg]
         depths = np.asarray(profile.depths_m, dtype=float)
-
         valid = depths[np.isfinite(depths) & (depths > 0)]
         if valid.size == 0:
             raise WaveBathymetryError(
@@ -53,18 +52,15 @@ class NearshoreWaveTransformer:
 
         h_deep = float(np.nanmax(valid))
         h_point = float(depths[0]) if (np.isfinite(depths[0]) and depths[0] > 0) else float(valid[0])
-
         hs_shoaled, ks = self.shoaling_model.transform(hs_offshore, h_deep, h_point)
         hs_break, h_break = self.breaking_model.apply(hs_offshore, h_deep, valid)
         hs_near = min(float(hs_shoaled), float(hs_break))
-
         cos_shore, theta_out_deg = self.refraction_model.transform(
             direction_deg=float(direction_deg),
             shore_normal_deg=self.shore_normal_deg,
             h_deep=h_deep,
             h_point=h_point,
         )
-
         return NearshoreWaveRecord(
             hs_nearshore_m=float(hs_near),
             ks=float(ks),

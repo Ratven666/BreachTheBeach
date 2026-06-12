@@ -9,18 +9,35 @@ class TracePreprocessor:
     @staticmethod
     def prepare(df: pd.DataFrame) -> pd.DataFrame:
         cols = {c.lower().replace(" ", "_"): c for c in df.columns}
-        az = cols.get("direction") or cols.get("azimuth") or cols.get("azimuth_deg")
-        dist = cols.get("fetch_m") or cols.get("distance_m") or cols.get("distance")
+
+        # Поддержка имён из трассировщика: azimuth_deg → direction
+        az = (
+            cols.get("direction")
+            or cols.get("azimuth_deg")
+            or cols.get("azimuth")
+        )
+        # Поддержка имён из трассировщика: fetch_length_m → fetch_m
+        dist = (
+            cols.get("fetch_m")
+            or cols.get("fetch_length_m")
+            or cols.get("distance_m")
+            or cols.get("distance")
+        )
 
         if az is None or dist is None:
             raise WaveInputError(
-                f"Trace input must contain direction and fetch_m columns. Got: {list(df.columns)}"
+                f"Trace input must contain direction/azimuth_deg and "
+                f"fetch_m/fetch_length_m columns. Got: {list(df.columns)}"
             )
 
         out = df[[az, dist]].copy()
         out.columns = ["direction", "fetch_m"]
         out["direction"] = (
-            pd.to_numeric(out["direction"], errors="coerce").round().fillna(0).astype(int) % 360
+            pd.to_numeric(out["direction"], errors="coerce")
+            .round()
+            .fillna(0)
+            .astype(int)
+            % 360
         )
         out["fetch_m"] = pd.to_numeric(out["fetch_m"], errors="coerce").fillna(0.0)
         out = (

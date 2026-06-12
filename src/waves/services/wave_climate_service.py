@@ -8,7 +8,13 @@ import pandas as pd
 from src.waves.energy import WaveEnergyCalculator
 from src.waves.fetch import FetchLookup
 from src.waves.input import TracePreprocessor, WindTimeSeriesPreprocessor, read_trace_csv, read_wind_ts_csv
-from src.waves.nearshore import BathymetryProfileProvider, NearshoreWaveTransformer, BreakingModel, RefractionModel, ShoalingModel
+from src.waves.nearshore import (
+    BathymetryProfileProvider,
+    NearshoreWaveTransformer,
+    BreakingModel,
+    RefractionModel,
+    ShoalingModel,
+)
 from src.waves.offshore import SMBWaveGrowthModel
 from src.waves.shoreline import ShoreNormalEstimator
 from src.waves.stats import WaveClimateStatistics
@@ -28,14 +34,22 @@ class WaveClimateService:
     overwater_factor: float = 1.1
     rho_water: float = 1025.0
     g: float = 9.81
+    # Пробрасываются из WaveClimateBatchProcessor в NearshoreWaveTransformer
+    default_h_deep_m: float = 20.0
+    default_h_point_m: float = 3.0
 
     def __post_init__(self) -> None:
         self.trace_df = TracePreprocessor.prepare(self.trace_df.copy())
         self.wind_ts_df = WindTimeSeriesPreprocessor.prepare(self.wind_ts_df.copy())
         self._fetch_lookup = FetchLookup(self.trace_df)
-        self._shore_normal = float(self.shore_normal_deg) if self.shore_normal_deg is not None else ShoreNormalEstimator.estimate(self.trace_df)
+        self._shore_normal = (
+            float(self.shore_normal_deg)
+            if self.shore_normal_deg is not None
+            else ShoreNormalEstimator.estimate(self.trace_df)
+        )
         self._offshore_model = SMBWaveGrowthModel(g=self.g)
         self._energy = WaveEnergyCalculator(rho_water=self.rho_water, g=self.g)
+
         profile_provider = None
         if self.bathymetry_service is not None:
             profile_provider = BathymetryProfileProvider(
@@ -45,17 +59,25 @@ class WaveClimateService:
                 radius_m=self.bathy_radius_m,
                 n_steps=self.bathy_n_steps,
             )
+
         self._nearshore = NearshoreWaveTransformer(
             shore_normal_deg=self._shore_normal,
             profile_provider=profile_provider,
             shoaling_model=ShoalingModel(),
             breaking_model=BreakingModel(gamma_b=self.breaking_coeff),
             refraction_model=RefractionModel(g=self.g),
+            # Передаём глубины по умолчанию — теперь настраиваемые снаружи
+            default_h_deep_m=self.default_h_deep_m,
+            default_h_point_m=self.default_h_point_m,
         )
 
     @classmethod
     def from_csv(cls, trace_csv: str, wind_ts_csv: str, **kwargs) -> "WaveClimateService":
-        return cls(trace_df=read_trace_csv(trace_csv), wind_ts_df=read_wind_ts_csv(wind_ts_csv), **kwargs)
+        return cls(
+            trace_df=read_trace_csv(trace_csv),
+            wind_ts_df=read_wind_ts_csv(wind_ts_csv),
+            **kwargs,
+        )
 
     @property
     def shore_normal(self) -> float:
@@ -71,7 +93,11 @@ class WaveClimateService:
             direction = int(row["direction"])
             fetch_m = self._fetch_lookup.get_fetch(direction)
             hs_off, tp = self._offshore_model.calculate(u_ms, fetch_m)
-            near = self._nearshore.transform(direction_deg=direction, hs_offshore=hs_off, tp_s=tp)
+            near = self._nearshore.transform(
+                direction_deg=direction,
+                hs_offshore=hs_off,
+                tp_s=tp,
+            )
             power = self._energy.wave_power(near.hs_nearshore_m, tp)
             cwef = self._energy.cwef(power, near.cos_shore)
             records.append(

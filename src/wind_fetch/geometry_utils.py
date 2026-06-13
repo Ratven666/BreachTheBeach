@@ -1,99 +1,95 @@
+# src/wind_fetch/geometry_utils.py
 from __future__ import annotations
 
-from math import isfinite
+import math
+from typing import Sequence
 
 from pyproj import Geod
-from shapely.geometry import LineString, MultiLineString, Point
 
-WGS84_GEOD = Geod(ellps="WGS84")
+from shapely.geometry import (
+    LineString,
+    MultiLineString,
+    GeometryCollection,
+    MultiPolygon,
+    Polygon,
+)
+from shapely.geometry.base import BaseGeometry
 
+_GEOD = Geod(ellps="WGS84")
 
-def era5_from_to_ray_azimuth(era5_from_deg: float) -> float:
+def iter_lines(geom: BaseGeometry):
     """
-    ERA5 / meteorological convention:
-    0 = wind blowing FROM north, 90 = FROM east, etc.
-    For fetch tracing we need the direction TO which the air moves.
+    Рекурсивно извлекает все LineString-компоненты из произвольной геометрии.
+    Поддерживает LineString, MultiLineString, Polygon (границы),
+    MultiPolygon и GeometryCollection.
     """
-    return (float(era5_from_deg) + 180.0) % 360.0
-
-
-def geodesic_forward_point(lon: float, lat: float, azimuth_deg: float, distance_m: float) -> tuple[float, float]:
-    lon2, lat2, _ = WGS84_GEOD.fwd(lon, lat, azimuth_deg, distance_m)
-    return float(lon2), float(lat2)
-
-
-def geodesic_distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    _, _, dist = WGS84_GEOD.inv(lon1, lat1, lon2, lat2)
-    return float(dist)
-
-
-def build_geodesic_linestring(
-    lon: float,
-    lat: float,
-    azimuth_deg: float,
-    total_length_m: float,
-    step_m: float,
-    max_segments: int,
-) -> LineString:
-    if total_length_m <= 0:
-        raise ValueError("total_length_m must be > 0")
-    if step_m <= 0:
-        raise ValueError("step_m must be > 0")
-
-    n_steps = max(1, min(max_segments, int(total_length_m // step_m) + 1))
-    coords: list[tuple[float, float]] = [(lon, lat)]
-
-    for i in range(1, n_steps + 1):
-        dist = min(total_length_m, i * step_m)
-        lon_i, lat_i = geodesic_forward_point(lon, lat, azimuth_deg, dist)
-        coords.append((lon_i, lat_i))
-
-        if dist >= total_length_m:
-            break
-
-    if coords[-1] != coords[0]:
-        lon_end, lat_end = geodesic_forward_point(lon, lat, azimuth_deg, total_length_m)
-        if coords[-1] != (lon_end, lat_end):
-            coords.append((lon_end, lat_end))
-
-    return LineString(coords)
-
-
-def iter_lines(geom):
     if geom is None or geom.is_empty:
         return
+
     if isinstance(geom, LineString):
         yield geom
-        return
-    if isinstance(geom, MultiLineString):
-        for part in geom.geoms:
-            if not part.is_empty:
-                yield part
-        return
-    if hasattr(geom, "geoms"):
+
+    elif isinstance(geom, MultiLineString):
         for part in geom.geoms:
             yield from iter_lines(part)
 
+    elif isinstance(geom, Polygon):
+        # Внешняя граница
+        yield LineString(geom.exterior.coords)
+        # Внутренние границы (дыры)
+        for interior in geom.interiors:
+            yield LineString(interior.coords)
 
-def extract_points_from_intersection(geom):
-    if geom is None or geom.is_empty:
-        return []
+    elif isinstance(geom, MultiPolygon):
+        for poly in geom.geoms:
+            yield from iter_lines(poly)
 
-    if isinstance(geom, Point):
-        return [geom]
-
-    points = []
-    if hasattr(geom, "geoms"):
+    elif isinstance(geom, GeometryCollection):
         for part in geom.geoms:
-            points.extend(extract_points_from_intersection(part))
-        return points
+            yield from iter_lines(part)
 
-    if hasattr(geom, "coords"):
-        try:
-            coords = list(geom.coords)
-        except Exception:
-            coords = []
-        for x, y in coords:
-            if isfinite(x) and isfinite(y):
-                points.append(Point(x, y))
-    return points
+def geodesic_forward_point(
+    lon: float,
+    lat: float,
+    azimuth_deg: float,
+    distance_m: float,
+) -> tuple[float, float]:
+    """Возвращает (lon, lat) точки, отстоящей на distance_m по азимуту azimuth_deg."""
+    end_lon, end_lat, _ = _GEOD.fwd(lon, lat, azimuth_deg, distance_m)
+    return float(end_lon), float(end_lat)
+
+
+def normalize_azimuths(
+    azimuths: Sequence[float | int],
+) -> list[float]:
+    """
+    Приводит список азимутов к диапазону [0, 360).
+    Единственная реализация — используется всеми калькуляторами.
+    """
+    return [float(a) % 360.0 for a in azimuths]
+
+
+def normalize_angle(value: float | int) -> float:
+    """Приводит одиночный угол к [0, 360)."""
+    return float(value) % 360.0
+
+
+def azimuth_to_dxdy(azimuth_deg: float) -> tuple[float, float]:
+    """Единичный вектор направления (dx, dy) по азимуту (CW от севера)."""
+    rad = math.radians(azimuth_deg)
+    return math.sin(rad), math.cos(rad)
+
+
+def is_in_land_sector(
+    ray_azimuth_deg: float,
+    normal_azimuth_deg: float,
+    half_sector_deg: float,
+) -> bool:
+    """
+    True, если ray_azimuth_deg попадает в сухопутный сектор
+    ±half_sector_deg вокруг нормали, направленной в сторону суши
+    (т.е. противоположной нормали к морю).
+    """
+    land_normal = (normal_azimuth_deg + 180.0) % 360.0
+    diff = abs((ray_azimuth_deg - land_normal + 180.0) % 360.0 - 180.0)
+    return diff <= half_sector_deg

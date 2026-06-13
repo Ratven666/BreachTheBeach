@@ -1,3 +1,4 @@
+# src/wind_fetch/WindFetchConfig.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ class WindFetchConfig:
     0 = north, 90 = east, 180 = south, 270 = west.
     """
 
+    # ── Выходные файлы (оригинальные поля) ────────────────────────────────
     output_dir: Path = Path("output")
 
     multi_output_csv_name: str = "multi_direction_fetch.csv"
@@ -24,6 +26,11 @@ class WindFetchConfig:
     multi_output_hit_points_name: str = "multi_direction_hit_points.geojson"
     multi_output_split_dirname: str = "multi_direction_split"
 
+    # Алиасы для WindFetchCalculator (однонаправленный режим)
+    output_csv_name: str = "wind_fetch_results.csv"
+    output_geojson_name: str = "wind_fetch_rays.geojson"
+
+    # ── Геометрия трассировки (оригинальные поля) ──────────────────────────
     default_offset_m: float = 1.0
     default_fetch_m: float = 100_000.0
 
@@ -36,3 +43,16 @@ class WindFetchConfig:
     azimuths_deg: list[float] = field(
         default_factory=lambda: [float(v) for v in range(360)]
     )
+
+    # ── НОВЫЕ поля (добавлены для WindFetchParallelRunner) ─────────────────
+    # Шаг геодезического луча в метрах
+    geodesic_step_m: float = 1_000.0
+    # Максимальное число сегментов на один луч
+    max_segments_per_ray: int = 200
+
+    # ── Параллельный запуск ────────────────────────────────────────────────
+    n_workers: int = 4
+    chunk_size: int = 50
+
+    # ── Сектор суши (для параллельного и многонаправленного режимов) ───────
+    half_land_sector_deg: float = 90.0

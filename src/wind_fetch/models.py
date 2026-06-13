@@ -1,3 +1,4 @@
+# src/wind_fetch/models.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,7 +14,9 @@ class WindFetchPaths:
 @dataclass(slots=True)
 class WindFetchResult:
     """
-    Оставлен для совместимости со старым WindFetchCalculator.
+    Результат трассировки одного луча для одной точки и одного азимута.
+    ray_azimuth_deg  — азимут самого луча (тот, по которому шла трассировка).
+    normal_azimuth_deg — нормаль берега в исходной точке (опорный азимут).
     """
 
     point_id: int
@@ -24,7 +27,9 @@ class WindFetchResult:
     start_point_lon: float
     start_point_lat: float
 
-    azimuth_deg: float
+    ray_azimuth_deg: float        # был azimuth_deg — переименован
+    normal_azimuth_deg: float     # новое поле
+
     fetch_length_m: float
 
     hit_found: bool
@@ -47,7 +52,7 @@ class MultiDirectionFetchResult:
     direction_id: int
 
     normal_azimuth_deg: float
-    azimuth_deg: float
+    azimuth_deg: float            # ray azimuth (абсолютный)
 
     source_point_lon: float
     source_point_lat: float

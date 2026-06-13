@@ -1,97 +1,68 @@
+# src/weather_history/wind_rose/WindRoseBuilder.py
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 
-from src.weather_history.wind_rose.bins import (
-    build_direction_centers,
-    build_direction_edges,
-    build_direction_labels,
-    build_speed_bins,
-)
-from src.weather_history.wind_rose.WindRose import WindRose, WindRoseTable
+
+@dataclass
+class WindRose:
+    nsector: int
+    frequencies: np.ndarray   # shape (nsector,)  — доли [0..1]
+    mean_speeds: np.ndarray   # shape (nsector,)
+    sector_centers: np.ndarray  # азимуты центров секторов, градусы
 
 
 class WindRoseBuilder:
-    def __init__(
-        self,
-        nsector: int = 16,
-        bins: int | list[float] | tuple[float, ...] | np.ndarray | None = None,
-        calm_limit: float | None = None,
-    ) -> None:
-        self.nsector = int(nsector)
-        self.bins = bins
-        self.calm_limit = calm_limit
+    """
+    Строит розу ветров по массивам скоростей и направлений.
+
+    Исправление: границы секторов сдвинуты на полшага (half_step),
+    чтобы северный сектор (0°/360°) не получал двойную ширину.
+    """
+
+    def __init__(self, nsector: int = 16) -> None:
+        if nsector < 4 or nsector % 2 != 0:
+            raise ValueError("nsector must be even and >= 4")
+        self.nsector = nsector
 
     def build(
         self,
-        speed: list[float | None] | tuple[float | None, ...] | np.ndarray,
-        direction: list[float | None] | tuple[float | None, ...] | np.ndarray,
-        ws_unit: str | None = None,
-        title: str | None = None,
+        speeds: np.ndarray,
+        directions: np.ndarray,
     ) -> WindRose:
-        speed_arr = np.asarray(speed, dtype=float)
-        dir_arr = np.asarray(direction, dtype=float)
+        speeds = np.asarray(speeds, dtype=float)
+        directions = np.asarray(directions, dtype=float) % 360.0
 
-        if speed_arr.shape != dir_arr.shape:
-            raise ValueError("speed and direction must have the same shape")
+        step = 360.0 / self.nsector
+        half_step = step / 2.0
 
-        mask = np.isfinite(speed_arr) & np.isfinite(dir_arr)
-        speed_arr = speed_arr[mask]
-        dir_arr = dir_arr[mask] % 360.0
+        # Границы секторов сдвинуты на -half_step, чтобы центры совпадали
+        # с кардинальными направлениями: 0°, 22.5°, 45° … при nsector=16
+        edges = np.linspace(-half_step, 360.0 - half_step, self.nsector + 1)
 
-        if self.calm_limit is not None:
-            mask = speed_arr > float(self.calm_limit)
-            speed_arr = speed_arr[mask]
-            dir_arr = dir_arr[mask]
+        # Нормализуем направления в диапазон [edges[0], edges[-1])
+        dirs_shifted = (directions - (-half_step)) % 360.0
 
-        direction_edges = build_direction_edges(self.nsector)
-        direction_centers = build_direction_centers(direction_edges)
-        direction_labels = build_direction_labels(self.nsector)
-        speed_bins = build_speed_bins(speed_arr, self.bins)
+        dir_idx = np.digitize(dirs_shifted, edges - (-half_step)) - 1
+        dir_idx = np.clip(dir_idx, 0, self.nsector - 1)
 
-        if speed_arr.size == 0:
-            table = np.zeros((len(speed_bins) - 1, self.nsector), dtype=int)
-            freq = np.zeros_like(table, dtype=float)
-            return WindRose(
-                speed=speed_arr,
-                direction=dir_arr,
-                ws_unit=ws_unit,
-                title=title,
-                table_data=WindRoseTable(
-                    speed_bins=speed_bins,
-                    direction_edges=direction_edges,
-                    direction_centers=direction_centers,
-                    direction_labels=direction_labels,
-                    table=table,
-                    frequencies_percent=freq,
-                    total_count=0,
-                ),
-            )
+        frequencies = np.zeros(self.nsector, dtype=float)
+        mean_speeds = np.zeros(self.nsector, dtype=float)
 
-        dir_idx = np.digitize(dir_arr, direction_edges, right=False) - 1
-        dir_idx = np.where(dir_idx == self.nsector, 0, dir_idx)
+        total = len(directions)
+        for s in range(self.nsector):
+            mask = dir_idx == s
+            count = np.sum(mask)
+            frequencies[s] = count / total if total > 0 else 0.0
+            mean_speeds[s] = float(np.mean(speeds[mask])) if count > 0 else 0.0
 
-        spd_idx = np.digitize(speed_arr, speed_bins, right=False) - 1
-        spd_idx = np.clip(spd_idx, 0, len(speed_bins) - 2)
-
-        table = np.zeros((len(speed_bins) - 1, self.nsector), dtype=int)
-        for s_i, d_i in zip(spd_idx, dir_idx, strict=False):
-            table[int(s_i), int(d_i)] += 1
-
-        freq = (table / float(len(speed_arr))) * 100.0
+        sector_centers = np.arange(self.nsector) * step  # 0, step, 2*step …
 
         return WindRose(
-            speed=speed_arr,
-            direction=dir_arr,
-            ws_unit=ws_unit,
-            title=title,
-            table_data=WindRoseTable(
-                speed_bins=speed_bins,
-                direction_edges=direction_edges,
-                direction_centers=direction_centers,
-                direction_labels=direction_labels,
-                table=table,
-                frequencies_percent=freq,
-                total_count=int(len(speed_arr)),
-            ),
+            nsector=self.nsector,
+            frequencies=frequencies,
+            mean_speeds=mean_speeds,
+            sector_centers=sector_centers,
         )

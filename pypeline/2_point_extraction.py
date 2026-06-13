@@ -47,7 +47,7 @@ def main() -> None:
     point_set = extractor.extract(
         dataset=dataset,
         strategy=EqualRadiusStrategy(
-            radius_step_m=1000.0,
+            radius_step_m=200.0,
             source=PointSource.MAIN_ONLY,
             include_origin=True,
             include_endpoint=True,

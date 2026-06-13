@@ -1,29 +1,37 @@
+# src/weather_history/domain/WeatherPoint.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
-from src.weather_history.wind_rose import (
-    MatplotlibWindRosePlotter,
-    PlotlyWindRosePlotter,
-    WindRose,
-    WindRoseBuilder,
-)
+from src.weather_history.wind_rose.WindRoseBuilder import WindRose, WindRoseBuilder
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WeatherTimeSeriesRow — вспомогательный тип одной записи тайм-серии
+# Требуется для __init__.py и внешнего API
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
 class WeatherTimeSeriesRow:
+    """Одна строка тайм-серии погодной точки."""
     point_id: Any
-    row_no: int
     date: str | None
     wind_speed: float | None
-    wind_direction: float | None
+    wind_dir: float | None
     ws_unit: str | None
     wd_unit: str | None
+    geometry: Point
+
+
+# Внешний кэш: (point_id, nsector) → WindRose
+# Вынесен ЗА пределы датакласса, чтобы не нарушать контракт frozen=True
+_WIND_ROSE_CACHE: dict[tuple[Any, int], WindRose] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,196 +48,82 @@ class WeatherPoint:
     source_req_lat: float | None
     source_req_lon: float | None
 
-    dates: tuple[str | None, ...] = field(default_factory=tuple)
-    wind_speed: tuple[float | None, ...] = field(default_factory=tuple)
-    wind_dir: tuple[float | None, ...] = field(default_factory=tuple)
+    dates: tuple[str | None, ...]
+    wind_speed: tuple[float | None, ...]
+    wind_dir: tuple[float | None, ...]
 
-    ws_unit: str | None = None
-    wd_unit: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
+    ws_unit: str | None
+    wd_unit: str | None
+    start_date: Any
+    end_date: Any
 
-    _wind_rose_cache: WindRose | None = field(default=None, init=False, repr=False, compare=False)
+    # ── wind rose ──────────────────────────────────────────────────────────
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "_wind_rose_cache", None)
-
-    @property
-    def x(self) -> float:
-        return float(self.geometry.x)
-
-    @property
-    def y(self) -> float:
-        return float(self.geometry.y)
-
-    @property
-    def records_count(self) -> int:
-        return len(self.dates)
-
-    @property
-    def has_weather(self) -> bool:
-        return len(self.dates) > 0 and len(self.wind_speed) > 0 and len(self.wind_dir) > 0
+    def build_wind_rose(self, nsector: int = 16) -> WindRose:
+        key = (self.point_id, nsector)
+        if key in _WIND_ROSE_CACHE:
+            return _WIND_ROSE_CACHE[key]
+        speeds, directions = self._valid_speed_dir_arrays()
+        rose = WindRoseBuilder(nsector=nsector).build(speeds, directions)
+        _WIND_ROSE_CACHE[key] = rose
+        return rose
 
     @property
     def wind_rose(self) -> WindRose:
-        cached = self._wind_rose_cache
-        if cached is not None:
-            return cached
+        return self.build_wind_rose(nsector=16)
 
-        rose = self.build_wind_rose(
-            nsector=16,
-            bins=None,
-            calm_limit=None,
-            title=f"Wind rose for point {self.point_id}",
-        )
-        object.__setattr__(self, "_wind_rose_cache", rose)
-        return rose
+    # ── вспомогательные ───────────────────────────────────────────────────
 
-    def build_wind_rose(
-        self,
-        nsector: int = 16,
-        bins: int | list[float] | tuple[float, ...] | None = None,
-        calm_limit: float | None = None,
-        title: str | None = None,
-    ) -> WindRose:
-        if len(self.wind_speed) != len(self.wind_dir):
-            raise ValueError(
-                f"wind_speed and wind_dir length mismatch for point {self.point_id}: "
-                f"{len(self.wind_speed)} != {len(self.wind_dir)}"
+    def _valid_speed_dir_arrays(self) -> tuple[np.ndarray, np.ndarray]:
+        paired = [
+            (s, d)
+            for s, d in zip(self.wind_speed, self.wind_dir)
+            if s is not None and d is not None
+        ]
+        if not paired:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        speeds, dirs = zip(*paired)
+        return np.array(speeds, dtype=float), np.array(dirs, dtype=float)
+
+    def to_timeseries_rows(self) -> list[WeatherTimeSeriesRow]:
+        """Возвращает список WeatherTimeSeriesRow — по одному на запись тайм-серии."""
+        return [
+            WeatherTimeSeriesRow(
+                point_id=self.point_id,
+                date=d,
+                wind_speed=s,
+                wind_dir=wd,
+                ws_unit=self.ws_unit,
+                wd_unit=self.wd_unit,
+                geometry=self.geometry,
             )
+            for d, s, wd in zip(self.dates, self.wind_speed, self.wind_dir)
+        ]
 
-        builder = WindRoseBuilder(
-            nsector=nsector,
-            bins=bins,
-            calm_limit=calm_limit,
-        )
-        return builder.build(
-            speed=self.wind_speed,
-            direction=self.wind_dir,
-            ws_unit=self.ws_unit,
-            title=title or f"Wind rose for point {self.point_id}",
-        )
+    def to_timeseries_gdf(self, crs: Any = "EPSG:4326") -> gpd.GeoDataFrame:
+        rows = [
+            {
+                "point_id": r.point_id,
+                "date": r.date,
+                "wind_speed": r.wind_speed,
+                "wind_dir": r.wind_dir,
+                "ws_unit": r.ws_unit,
+                "wd_unit": r.wd_unit,
+                "geometry": r.geometry,
+            }
+            for r in self.to_timeseries_rows()
+        ]
+        return gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
 
-    def plot_wind_rose_matplotlib(
-        self,
-        output_path: str | None = None,
-        nsector: int = 16,
-        bins: int | list[float] | tuple[float, ...] | None = None,
-        calm_limit: float | None = None,
-        cmap: str = "viridis",
-        figsize: tuple[float, float] = (8, 8),
-    ):
-        rose = self.build_wind_rose(
-            nsector=nsector,
-            bins=bins,
-            calm_limit=calm_limit,
-        )
-        plotter = MatplotlibWindRosePlotter()
-
-        if output_path is None:
-            return plotter.plot_bar(
-                wind_rose=rose,
-                figsize=figsize,
-                cmap=cmap,
-            )
-
-        return plotter.save_bar(
-            wind_rose=rose,
-            output_path=output_path,
-            figsize=figsize,
-            cmap=cmap,
-        )
-
-    def plot_wind_rose_plotly(
-        self,
-        output_path: str | None = None,
-        nsector: int = 16,
-        bins: int | list[float] | tuple[float, ...] | None = None,
-        calm_limit: float | None = None,
-    ):
-        rose = self.build_wind_rose(
-            nsector=nsector,
-            bins=bins,
-            calm_limit=calm_limit,
-        )
-        plotter = PlotlyWindRosePlotter()
-
-        if output_path is None:
-            return plotter.build_barpolar(rose)
-
-        return plotter.save_html(rose, output_path=output_path)
-
-    def timeseries_rows(self) -> list[WeatherTimeSeriesRow]:
-        rows: list[WeatherTimeSeriesRow] = []
-        n = min(len(self.dates), len(self.wind_speed), len(self.wind_dir))
-
-        for i in range(n):
-            rows.append(
-                WeatherTimeSeriesRow(
-                    point_id=self.point_id,
-                    row_no=i,
-                    date=self.dates[i],
-                    wind_speed=self.wind_speed[i],
-                    wind_direction=self.wind_dir[i],
-                    ws_unit=self.ws_unit,
-                    wd_unit=self.wd_unit,
-                )
-            )
-
-        return rows
-
-    def timeseries_df(self) -> pd.DataFrame:
-        return pd.DataFrame(
-            [
-                {
-                    "point_id": row.point_id,
-                    "row_no": row.row_no,
-                    "date": row.date,
-                    "wind_speed": row.wind_speed,
-                    "wind_direction": row.wind_direction,
-                    "ws_unit": row.ws_unit,
-                    "wd_unit": row.wd_unit,
-                }
-                for row in self.timeseries_rows()
-            ]
-        )
-
-    def to_timeseries_gdf(self, crs: Any = None) -> gpd.GeoDataFrame:
-        records: list[dict[str, Any]] = []
-
-        for row in self.timeseries_rows():
-            records.append(
-                {
-                    "point_id": row.point_id,
-                    "row_no": row.row_no,
-                    "date": row.date,
-                    "wind_speed": row.wind_speed,
-                    "wind_direction": row.wind_direction,
-                    "ws_unit": row.ws_unit,
-                    "wd_unit": row.wd_unit,
-                    "weather_strategy": self.weather_strategy,
-                    "weather_distance_m": self.weather_distance_m,
-                    "source_grid_point_id": self.source_grid_point_id,
-                    "source_lat": self.source_lat,
-                    "source_lon": self.source_lon,
-                    "source_req_lat": self.source_req_lat,
-                    "source_req_lon": self.source_req_lon,
-                    "start_date": self.start_date,
-                    "end_date": self.end_date,
-                    "geometry": self.geometry,
-                }
-            )
-
-        return gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
-
-    def brief_dict(self) -> dict[str, Any]:
-        return {
+    def to_summary_series(self) -> pd.Series:
+        speeds, dirs = self._valid_speed_dir_arrays()
+        return pd.Series({
             "point_id": self.point_id,
-            "x": self.x,
-            "y": self.y,
-            "records_count": self.records_count,
-            "weather_strategy": self.weather_strategy,
-            "weather_distance_m": self.weather_distance_m,
+            "lat": self.geometry.y,
+            "lon": self.geometry.x,
+            "n_records": len(speeds),
+            "mean_speed": float(np.mean(speeds)) if len(speeds) > 0 else None,
+            "max_speed": float(np.max(speeds)) if len(speeds) > 0 else None,
             "source_grid_point_id": self.source_grid_point_id,
-            "has_weather": self.has_weather,
-        }
+            "weather_distance_m": self.weather_distance_m,
+        })

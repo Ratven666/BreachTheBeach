@@ -160,6 +160,15 @@ def _build_fetch_lookup_all(fetch_df: pd.DataFrame) -> dict[int, pd.DataFrame]:
     logger.info(f"Fetch lookup построен для {len(result)} точек")
     return result
 
+def _resolve_point_bathy_service(bathymetry_service, lon, lat):
+    """Если есть for_point() → создаёт per-point сервис. Иначе — as-is."""
+    if bathymetry_service is None:
+        return None
+    factory_fn = getattr(bathymetry_service, "for_point", None)
+    if callable(factory_fn):
+        return factory_fn(lon, lat)   # ← ЧЕСТНЫЙ расчёт
+    return bathymetry_service         # ← fallback совместимость
+
 
 # ──────────────────────────────────────────────────────────────────
 # батч-процессор

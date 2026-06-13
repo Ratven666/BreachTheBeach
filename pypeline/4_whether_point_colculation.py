@@ -27,7 +27,7 @@ def main() -> None:
     # Единое имя с тем, что ожидает шаг 8 (WEATHER_GEOJSON)
     points_with_weather_geojson_path = output_dir / "points_with_weather.geojson"
 
-    weather_start_date = "2025-01-01"
+    weather_start_date = "1940-01-01"
     weather_end_date   = "2026-12-31"
 
     assignment_strategy = "idw"   # "nearest" | "idw"

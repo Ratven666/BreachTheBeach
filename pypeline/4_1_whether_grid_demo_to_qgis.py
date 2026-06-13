@@ -125,7 +125,7 @@ def build_weather_grid_lines(
 
 
 def main() -> None:
-    input_points_path = Path("../nvrsk_calc/nvrsk_equal_radius_200m_points.geojson")
+    input_points_path = Path("../nvrsk_calc/nvrsk_equal_radius_1000m_points.geojson")
     output_dir = Path("../nvrsk_calc/for_example")
     output_dir.mkdir(parents=True, exist_ok=True)
 

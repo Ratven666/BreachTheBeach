@@ -6,15 +6,15 @@ from typing import Optional
 from loguru import logger
 
 from src.base.BBox import BBox
-from src.bathymetry.cache.bathymetry_cache import BathymetryCache
+from src.bathymetry.cache.BathymetryCache import BathymetryCache
 from src.bathymetry.domain.models import BathymetryGrid, BathymetryProfile, GeoLine, GeoPoint
 from src.bathymetry.errors import BathymetryLoadError, BathymetryNotLoadedError
 from src.bathymetry.exporters.base import BathymetryExportStrategy, ProfileExportStrategy
-from src.bathymetry.interpolation.depth_interpolator import DepthInterpolator
-from src.bathymetry.loaders.base import BathymetryLoader
-from src.bathymetry.profile.profile_builder import ProfileBuilder
-from src.bathymetry.visualization.grid_plotter import BathymetryGridPlotter
-from src.bathymetry.visualization.profile_plotter import ProfilePlotter
+from src.bathymetry.interpolation.DepthInterpolator import DepthInterpolator
+from src.bathymetry.loaders.BathymetryLoader import BathymetryLoader
+from src.bathymetry.profile.ProfileBuilder import ProfileBuilder
+from src.bathymetry.visualization.BathymetryGridPlotter import BathymetryGridPlotter
+from src.bathymetry.visualization.ProfilePlotter import ProfilePlotter
 
 
 class BathymetryService:

@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+from loguru import logger
 import geopandas as gpd
 import networkx as nx
 from shapely import node as shapely_node, snap, unary_union

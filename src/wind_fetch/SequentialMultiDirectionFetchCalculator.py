@@ -186,12 +186,20 @@ class SequentialMultiDirectionFetchCalculator:
     def _iter_point_rows(self) -> list[tuple[int, pd.Series]]:
         rows: list[tuple[int, pd.Series]] = []
 
-        for point_id, (_, row) in enumerate(self.points_gdf_metric.iterrows(), start=1):
+        for _, row in self.points_gdf_metric.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
             if not isinstance(geom, Point):
                 continue
+            # point_id берётся из GDF — нумерация совпадает с CoastlineNormalPointSet (0-based)
+            if "point_id" in row.index and row["point_id"] is not None:
+                point_id = int(row["point_id"])
+            else:
+                raise ValueError(
+                    "Points GDF должен содержать колонку 'point_id'. "
+                    "Убедитесь, что передаётся файл с нормалями (шаг 3)."
+                )
             rows.append((point_id, row))
 
         return rows
@@ -725,6 +733,41 @@ class SequentialMultiDirectionFetchCalculator:
             )
 
         return gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+
+    def save_minimal(
+        self,
+        results: Sequence[MultiDirectionFetchResult],
+        output_dir: str | Path | None = None,
+    ) -> dict[str, str]:
+        """Сохраняет только файлы, необходимые для downstream пайплайна.
+
+        Записывает:
+        • fetch_by_point.csv     — агрегированная таблица (point × [azimuths, fetches])
+        • fetch_by_point.geojson — то же в геоформате для QGIS
+
+        Для полного набора отладочных слоёв используйте save_combined().
+        """
+        out_dir = Path(output_dir or self.config.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        aggregated_csv_path    = out_dir / "fetch_by_point.csv"
+        aggregated_points_path = out_dir / "fetch_by_point.geojson"
+
+        aggregated_gdf = self.to_aggregated_points_geodataframe(results)
+        aggregated_df  = pd.DataFrame(aggregated_gdf.drop(columns="geometry"))
+
+        aggregated_df.to_csv(aggregated_csv_path, index=False)
+        aggregated_gdf.to_file(aggregated_points_path, driver="GeoJSON")
+
+        logger.success(
+            f"Minimal fetch outputs saved: "
+            f"csv={aggregated_csv_path}, geojson={aggregated_points_path}"
+        )
+
+        return {
+            "aggregated_csv":            str(aggregated_csv_path),
+            "aggregated_points_geojson": str(aggregated_points_path),
+        }
 
     def save_combined(
         self,

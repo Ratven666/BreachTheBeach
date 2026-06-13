@@ -37,15 +37,17 @@ def load_point_set(
 
 
 def main() -> None:
-    coastline_path = "../nvrsk_calc/nvrsk_main_coastline.geojson"
+    coastline_path   = "../nvrsk_calc/nvrsk_main_coastline.geojson"
     other_lines_path = "../nvrsk_calc/nvrsk_other_lines.geojson"
-    points_path = "../nvrsk_calc/nvrsk_equal_radius_200m_points.geojson"
+    points_path      = "../nvrsk_calc/nvrsk_equal_radius_200m_points.geojson"
 
     output_dir = Path("../nvrsk_calc")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     normal_points_path = output_dir / "nvrsk_equal_radius_200m_points_with_normals.geojson"
-    normal_lines_path = output_dir / "nvrsk_equal_radius_200m_normal_lines.geojson"
+    # normal_lines не используется ни одним последующим шагом.
+    # Для визуализации в QGIS раскомментируйте:
+    # normal_lines_path = output_dir / "nvrsk_equal_radius_200m_normal_lines.geojson"
 
     dataset = CoastlineDataset.from_geojson(
         main_path=coastline_path,
@@ -78,13 +80,13 @@ def main() -> None:
         name="nvrsk_equal_radius_200m_points_with_normals",
     )
 
-    normal_lines = normal_points.to_normal_lines_gdf(normal_length_m=200.0)
-
     normal_points.to_geojson(normal_points_path)
-    normal_lines.to_file(normal_lines_path, driver="GeoJSON")
-
     logger.success(f"Normal points saved to: {normal_points_path}")
-    logger.success(f"Normal lines saved to: {normal_lines_path}")
+
+    # Раскомментируйте для сохранения линий нормалей (только QGIS-визуализация):
+    # normal_lines = normal_points.to_normal_lines_gdf(normal_length_m=200.0)
+    # normal_lines.to_file(normal_lines_path, driver="GeoJSON")
+    # logger.success(f"Normal lines saved to: {normal_lines_path}")
 
     print(normal_points)
     print(normal_points.summary())

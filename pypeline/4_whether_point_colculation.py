@@ -13,32 +13,33 @@ from src.weather_history.wheather_downloaders.open_meteo import (
 
 def main() -> None:
     output_dir = Path("../nvrsk_calc")
-    cache_dir = Path("../data/cache/open_meteo")
+    cache_dir  = Path("../data/cache/open_meteo")
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # normal_points_geojson_path = Path(
-    #     "nvrsk_calc/nvrsk_equal_radius_200m_points_with_normals.geojson"
-    # )
+    # Используем точки С нормалями — только они содержат normal_azimuth_deg,
+    # который нужен шагу 8. Нумерация point_id совпадёт с fetch CSV.
     points_geojson_path = Path(
-        "../nvrsk_calc/nvrsk_equal_radius_200m_points.geojson"
+        "../nvrsk_calc/nvrsk_equal_radius_200m_points_with_normals.geojson"
     )
 
-    weather_grid_geojson_path = output_dir / "weather_daily_grid_for_normal_points.geojson"
-    points_with_weather_geojson_path = output_dir / "normal_points_with_weather.geojson"
+    weather_grid_geojson_path    = output_dir / "weather_daily_grid_for_normal_points.geojson"
+    # Единое имя с тем, что ожидает шаг 8 (WEATHER_GEOJSON)
+    points_with_weather_geojson_path = output_dir / "points_with_weather.geojson"
 
     weather_start_date = "1940-01-01"
-    weather_end_date = "2026-12-31"
+    weather_end_date   = "2026-12-31"
 
     assignment_strategy = "idw"   # "nearest" | "idw"
     idw_power = 2.0
-    idw_k = 4
+    idw_k     = 4
 
     working_crs = "EPSG:32637"
 
     if not points_geojson_path.exists():
         raise FileNotFoundError(
-            f"Input file not found: {points_geojson_path}"
+            f"Input file not found: {points_geojson_path}\n"
+            "Сначала выполните шаг 3 (3_normals_calculation.py)."
         )
 
     logger.info(f"Input normal points: {points_geojson_path}")

@@ -39,12 +39,12 @@ def load_point_set(
 def main() -> None:
     coastline_path   = "../nvrsk_calc/nvrsk_main_coastline.geojson"
     other_lines_path = "../nvrsk_calc/nvrsk_other_lines.geojson"
-    points_path      = "../nvrsk_calc/nvrsk_equal_radius_200m_points.geojson"
+    points_path      = "../nvrsk_calc/nvrsk_equal_radius_1000m_points.geojson"
 
     output_dir = Path("../nvrsk_calc")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    normal_points_path = output_dir / "nvrsk_equal_radius_200m_points_with_normals.geojson"
+    normal_points_path = output_dir / "nvrsk_equal_radius_1000m_points_with_normals.geojson"
     # normal_lines не используется ни одним последующим шагом.
     # Для визуализации в QGIS раскомментируйте:
     # normal_lines_path = output_dir / "nvrsk_equal_radius_200m_normal_lines.geojson"

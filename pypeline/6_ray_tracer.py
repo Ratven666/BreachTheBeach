@@ -4,24 +4,22 @@ from pathlib import Path
 
 from loguru import logger
 
-from src.wind_fetch import (
-    SequentialMultiDirectionFetchCalculator,
-    WindFetchConfig,
-    WindFetchPaths,
-)
+from wind_fetch import WindFetchConfig
+from wind_fetch.SequentialMultiDirectionFetchCalculator import SequentialMultiDirectionFetchCalculator
+from wind_fetch.models import WindFetchPaths
 
 
 def main() -> None:
     paths = WindFetchPaths(
-        main_coastline_path="../nvrsk_calc/merged_main.geojson",
-        other_coastline_path="../nvrsk_calc/merged_other.geojson",
-        points_with_normals_path="../nvrsk_calc/nvrsk_equal_radius_200m_points_with_normals.geojson",
+        main_coastline_path="../nvrsk_calc/for_example/merged_main.geojson",
+        other_coastline_path="../nvrsk_calc/for_example/merged_other.geojson",
+        points_with_normals_path="../nvrsk_calc/nvrsk_equal_radius_1000m_points_with_normals.geojson",
     )
 
     config = WindFetchConfig(
-        default_fetch_m=500_000,
+        default_fetch_m=100_000,
         default_offset_m=10,
-        azimuths_deg=list(range(0, 360, 10)),
+        azimuths_deg=list(range(0, 360)),
         output_dir="../nvrsk_calc/fetch",
     )
 

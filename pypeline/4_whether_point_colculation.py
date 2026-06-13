@@ -20,14 +20,14 @@ def main() -> None:
     # Используем точки С нормалями — только они содержат normal_azimuth_deg,
     # который нужен шагу 8. Нумерация point_id совпадёт с fetch CSV.
     points_geojson_path = Path(
-        "../nvrsk_calc/nvrsk_equal_radius_200m_points_with_normals.geojson"
+        "../nvrsk_calc/nvrsk_equal_radius_1000m_points.geojson"
     )
 
-    weather_grid_geojson_path    = output_dir / "weather_daily_grid_for_normal_points.geojson"
+    weather_grid_geojson_path    = output_dir / "weather_daily_grid_for_points.geojson"
     # Единое имя с тем, что ожидает шаг 8 (WEATHER_GEOJSON)
     points_with_weather_geojson_path = output_dir / "points_with_weather.geojson"
 
-    weather_start_date = "1940-01-01"
+    weather_start_date = "2025-01-01"
     weather_end_date   = "2026-12-31"
 
     assignment_strategy = "idw"   # "nearest" | "idw"

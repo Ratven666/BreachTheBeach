@@ -26,8 +26,8 @@ def build_dataset(
 def main() -> None:
     coastline_path = "../nvrsk_calc/nvrsk_main_coastline.geojson"
     other_lines_path = "../nvrsk_calc/nvrsk_other_lines.geojson"
-    points_output_path = Path("../nvrsk_calc/nvrsk_equal_radius_200m_points.geojson")
-    points_output_path = Path("../nvrsk_calc/for_example/nvrsk_points_nodes_endpoints.geojson")
+    points_output_path = Path("../nvrsk_calc/nvrsk_equal_radius_1000m_points.geojson")
+    # points_output_path = Path("../nvrsk_calc/for_example/nvrsk_points_nodes_endpoints.geojson")
     # points_output_path = Path("nvrsk_calc/nvrsk_points_equal_step_200m.geojson")
 
     dataset = build_dataset(
@@ -47,14 +47,14 @@ def main() -> None:
     point_set = extractor.extract(
         dataset=dataset,
         strategy=EqualRadiusStrategy(
-            radius_step_m=200.0,
+            radius_step_m=1000.0,
             source=PointSource.MAIN_ONLY,
             include_origin=True,
             include_endpoint=True,
             working_crs=None,
             input_crs="EPSG:4326",
         ),
-        name="nvrsk_points_equal_radius_200m",
+        name="nvrsk_points_equal_radius_1000m",
     )
 
     # point_set = extractor.extract(

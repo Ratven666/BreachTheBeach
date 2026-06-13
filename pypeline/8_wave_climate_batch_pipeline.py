@@ -17,7 +17,7 @@ from src.waves.services.wave_climate_batch import WaveClimateBatchProcessor
 BASE = Path("../nvrsk_calc")
 
 # ── Входные файлы ────────────────────────────────────────────────────────────
-POINTS_PATH   = BASE / "nvrsk_equal_radius_200m_points_with_normals.geojson"
+POINTS_PATH   = BASE / "nvrsk_equal_radius_1000m_points_with_normals.geojson"
 FETCH_CSV     = BASE / "fetch" / "fetch_by_point.csv"
 # Имя совпадает с выходом шага 4
 WEATHER_GEOJSON = BASE / "points_with_weather.geojson"

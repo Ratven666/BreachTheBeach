@@ -5,7 +5,7 @@ from src.coastline.domain import CoastlineDataset
 if __name__ == "__main__":
     from loguru import logger
 
-    OUTER_MAIN_PATH = r"../nvrsk_calc/NVRSK_BlackSeaCoastlineS2Coast2023.geojson"
+    OUTER_MAIN_PATH = r"../data/NVRSK_BlackSeaCoastlineS2Coast2023.geojson"
     # OUTER_OTHER_PATH = r"data/nvrsk_black_sea_other_lines_fast.geojson"
 
     INNER_MAIN_PATH = r"../nvrsk_calc/nvrsk_main_coastline.geojson"

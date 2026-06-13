@@ -28,7 +28,7 @@ class BathymetryDownloadCase:
     loader_mode: LoaderMode = "auto"
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = PROJECT_ROOT / "nvrsk_calc" / "bathymetry_from_bbox"
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 

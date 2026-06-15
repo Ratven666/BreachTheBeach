@@ -1,4 +1,4 @@
-from .loader_factory import BathymetryCoverage, BathymetryLoaderFactory
+from .BathymetryLoaderFactory import BathymetryCoverage, BathymetryLoaderFactory
 
 __all__ = [
     "BathymetryCoverage",

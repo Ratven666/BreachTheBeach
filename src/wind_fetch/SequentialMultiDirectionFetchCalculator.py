@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -31,6 +33,11 @@ class SequentialMultiDirectionFetchCalculator:
       честная трассировка не считается:
         fetch_length_m = offset_m
     - иначе выполняется обычная трассировка до первого пересечения.
+
+    Главный сохранённый результат:
+    - одна строка на исходную точку;
+    - геометрия = исходная точка;
+    - в атрибутах лежат списки азимутов и длин fetch.
     """
 
     def __init__(
@@ -179,12 +186,20 @@ class SequentialMultiDirectionFetchCalculator:
     def _iter_point_rows(self) -> list[tuple[int, pd.Series]]:
         rows: list[tuple[int, pd.Series]] = []
 
-        for point_id, (_, row) in enumerate(self.points_gdf_metric.iterrows(), start=1):
+        for _, row in self.points_gdf_metric.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
             if not isinstance(geom, Point):
                 continue
+            # point_id берётся из GDF — нумерация совпадает с CoastlineNormalPointSet (0-based)
+            if "point_id" in row.index and row["point_id"] is not None:
+                point_id = int(row["point_id"])
+            else:
+                raise ValueError(
+                    "Points GDF должен содержать колонку 'point_id'. "
+                    "Убедитесь, что передаётся файл с нормалями (шаг 3)."
+                )
             rows.append((point_id, row))
 
         return rows
@@ -323,13 +338,10 @@ class SequentialMultiDirectionFetchCalculator:
         normal_azimuth_deg: float,
         azimuth_deg: float,
     ) -> bool:
-        """
-        Сухопутный сектор задаётся как [normal+90, normal+270),
-        что эквивалентно проверке:
-            delta = (azimuth - normal) mod 360
-            90 <= delta < 270
-        """
-        delta = (self._normalize_azimuth_deg(azimuth_deg) - self._normalize_azimuth_deg(normal_azimuth_deg)) % 360.0
+        delta = (
+            self._normalize_azimuth_deg(azimuth_deg)
+            - self._normalize_azimuth_deg(normal_azimuth_deg)
+        ) % 360.0
         return 90.0 <= delta < 270.0
 
     def calculate(
@@ -519,6 +531,65 @@ class SequentialMultiDirectionFetchCalculator:
             for r in results
         )
 
+    def to_aggregated_points_geodataframe(
+        self,
+        results: Sequence[MultiDirectionFetchResult],
+    ) -> gpd.GeoDataFrame:
+        grouped: dict[int, list[MultiDirectionFetchResult]] = defaultdict(list)
+
+        for r in results:
+            grouped[r.point_id].append(r)
+
+        rows = []
+
+        for point_id, items in sorted(grouped.items(), key=lambda item: item[0]):
+            items_sorted = sorted(items, key=lambda r: (r.azimuth_deg, r.direction_id))
+            first = items_sorted[0]
+
+            azimuths = [float(r.azimuth_deg) for r in items_sorted]
+            fetch_lengths = [float(r.fetch_length_m) for r in items_sorted]
+            hit_found_list = [bool(r.hit_found) for r in items_sorted]
+            used_default_list = [bool(r.used_default_value) for r in items_sorted]
+            skipped_land_list = [bool(r.skipped_by_land_sector) for r in items_sorted]
+            hit_lons = [None if r.hit_lon is None else float(r.hit_lon) for r in items_sorted]
+            hit_lats = [None if r.hit_lat is None else float(r.hit_lat) for r in items_sorted]
+
+            rows.append(
+                {
+                    "point_id": int(point_id),
+                    "normal_azimuth_deg": float(first.normal_azimuth_deg),
+                    "source_lon": float(first.source_point_lon),
+                    "source_lat": float(first.source_point_lat),
+                    "start_lon": float(first.start_point_lon),
+                    "start_lat": float(first.start_point_lat),
+                    "azimuths_deg": json.dumps(azimuths, ensure_ascii=False, separators=(",", ":")),
+                    "fetch_lengths_m": json.dumps(fetch_lengths, ensure_ascii=False, separators=(",", ":")),
+                    "hit_found_list": json.dumps(hit_found_list, ensure_ascii=False, separators=(",", ":")),
+                    "used_default_value_list": json.dumps(
+                        used_default_list,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "skipped_by_land_sector_list": json.dumps(
+                        skipped_land_list,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "hit_lons": json.dumps(hit_lons, ensure_ascii=False, separators=(",", ":")),
+                    "hit_lats": json.dumps(hit_lats, ensure_ascii=False, separators=(",", ":")),
+                    "geometry": Point(first.source_point_lon, first.source_point_lat),
+                }
+            )
+
+        return gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+
+    def to_aggregated_dataframe(
+        self,
+        results: Sequence[MultiDirectionFetchResult],
+    ) -> pd.DataFrame:
+        aggregated_gdf = self.to_aggregated_points_geodataframe(results)
+        return pd.DataFrame(aggregated_gdf.drop(columns="geometry"))
+
     def to_points_geodataframe(
         self,
         results: Sequence[MultiDirectionFetchResult],
@@ -663,6 +734,41 @@ class SequentialMultiDirectionFetchCalculator:
 
         return gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
 
+    def save_minimal(
+        self,
+        results: Sequence[MultiDirectionFetchResult],
+        output_dir: str | Path | None = None,
+    ) -> dict[str, str]:
+        """Сохраняет только файлы, необходимые для downstream пайплайна.
+
+        Записывает:
+        • fetch_by_point.csv     — агрегированная таблица (point × [azimuths, fetches])
+        • fetch_by_point.geojson — то же в геоформате для QGIS
+
+        Для полного набора отладочных слоёв используйте save_combined().
+        """
+        out_dir = Path(output_dir or self.config.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        aggregated_csv_path    = out_dir / "fetch_by_point.csv"
+        aggregated_points_path = out_dir / "fetch_by_point.geojson"
+
+        aggregated_gdf = self.to_aggregated_points_geodataframe(results)
+        aggregated_df  = pd.DataFrame(aggregated_gdf.drop(columns="geometry"))
+
+        aggregated_df.to_csv(aggregated_csv_path, index=False)
+        aggregated_gdf.to_file(aggregated_points_path, driver="GeoJSON")
+
+        logger.success(
+            f"Minimal fetch outputs saved: "
+            f"csv={aggregated_csv_path}, geojson={aggregated_points_path}"
+        )
+
+        return {
+            "aggregated_csv":            str(aggregated_csv_path),
+            "aggregated_points_geojson": str(aggregated_points_path),
+        }
+
     def save_combined(
         self,
         results: Sequence[MultiDirectionFetchResult],
@@ -671,14 +777,23 @@ class SequentialMultiDirectionFetchCalculator:
         out_dir = Path(output_dir or self.config.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        csv_path = out_dir / self.config.multi_output_csv_name
+        aggregated_csv_path = out_dir / "fetch_by_point.csv"
+        aggregated_points_path = out_dir / "fetch_by_point.geojson"
+
+        full_csv_path = out_dir / self.config.multi_output_csv_name
         source_points_path = out_dir / self.config.multi_output_points_name
         start_points_path = out_dir / self.config.multi_output_start_points_name
         offset_segments_path = out_dir / self.config.multi_output_offset_segments_name
         rays_path = out_dir / self.config.multi_output_rays_name
         hit_points_path = out_dir / self.config.multi_output_hit_points_name
 
-        self.to_dataframe(results).to_csv(csv_path, index=False)
+        aggregated_gdf = self.to_aggregated_points_geodataframe(results)
+        aggregated_df = pd.DataFrame(aggregated_gdf.drop(columns="geometry"))
+
+        aggregated_df.to_csv(aggregated_csv_path, index=False)
+        aggregated_gdf.to_file(aggregated_points_path, driver="GeoJSON")
+
+        self.to_dataframe(results).to_csv(full_csv_path, index=False)
         self.to_points_geodataframe(results).to_file(source_points_path, driver="GeoJSON")
         self.to_start_points_geodataframe(results).to_file(start_points_path, driver="GeoJSON")
         self.to_offset_segments_geodataframe(results).to_file(offset_segments_path, driver="GeoJSON")
@@ -687,7 +802,9 @@ class SequentialMultiDirectionFetchCalculator:
 
         logger.success(
             f"Saved combined outputs: "
-            f"csv={csv_path}, "
+            f"aggregated_csv={aggregated_csv_path}, "
+            f"aggregated_points={aggregated_points_path}, "
+            f"full_csv={full_csv_path}, "
             f"source_points={source_points_path}, "
             f"start_points={start_points_path}, "
             f"offset_segments={offset_segments_path}, "
@@ -696,7 +813,9 @@ class SequentialMultiDirectionFetchCalculator:
         )
 
         return {
-            "csv": str(csv_path),
+            "aggregated_csv": str(aggregated_csv_path),
+            "aggregated_points_geojson": str(aggregated_points_path),
+            "full_csv": str(full_csv_path),
             "source_points_geojson": str(source_points_path),
             "start_points_geojson": str(start_points_path),
             "offset_segments_geojson": str(offset_segments_path),

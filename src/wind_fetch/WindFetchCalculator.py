@@ -1,711 +1,374 @@
+# src/wind_fetch/WindFetchCalculator.py
 from __future__ import annotations
 
-from abc import ABC
+import csv
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any
 
 import geopandas as gpd
 import pandas as pd
 from loguru import logger
+from pyproj import Geod
 from shapely.geometry import LineString, Point
 
-from src.coastline.domain.CoastlineDataset import CoastlineDataset
+from src.wind_fetch.CoastlineSpatialIndex import CoastlineSpatialIndex
+from src.wind_fetch.WindFetchConfig import WindFetchConfig
+from src.wind_fetch.geometry_utils import geodesic_forward_point, normalize_azimuths
+from src.wind_fetch.models import MultiDirectionFetchResult, WindFetchResult
 
-from .CoastlineSpatialIndex import CoastlineSpatialIndex
-from .WindFetchConfig import WindFetchConfig
-from .geometry_utils import (
-    build_geodesic_linestring,
-    extract_points_from_intersection,
-    geodesic_distance_m,
-    geodesic_forward_point,
-)
-from .models import MultiDirectionFetchResult, WindFetchPaths, WindFetchResult
+_GEOD = Geod(ellps="WGS84")
 
 
-class _BaseFetchCalculator(ABC):
-    def __init__(
-        self,
-        paths: WindFetchPaths,
-        config: WindFetchConfig | None = None,
-        *,
-        dataset_name: str,
-    ) -> None:
-        self.paths = paths
-        self.config = config or WindFetchConfig()
+# ─────────────────────────────────────────────────────────────────────────────
+# Вспомогательный helper: конечная точка луча
+# ─────────────────────────────────────────────────────────────────────────────
 
-        self.dataset = CoastlineDataset.from_geojson(
-            main_path=paths.main_coastline_path,
-            other_path=paths.other_coastline_path,
-            name=dataset_name,
-        )
-
-        self.points_gdf = self._load_points(paths.points_with_normals_path)
-        self.coastline_gdf = self._load_coastline()
-        self.index = CoastlineSpatialIndex(self.coastline_gdf)
-
-        self._point_geometries = self.points_gdf.geometry.values
-
-        logger.info(
-            f"{self.__class__.__name__} initialized: "
-            f"coastline_features={len(self.coastline_gdf)}, "
-            f"points={len(self.points_gdf)}"
-        )
-
-    def _load_points(self, path: str | Path) -> gpd.GeoDataFrame:
-        gdf = gpd.read_file(path)
-
-        if gdf.crs is None:
-            gdf = gdf.set_crs("EPSG:4326")
-        elif str(gdf.crs) != "EPSG:4326":
-            gdf = gdf.to_crs("EPSG:4326")
-
-        return gdf
-
-    def _load_coastline(self) -> gpd.GeoDataFrame:
-        gdf = self.dataset.combined_gdf
-
-        if gdf.crs is None:
-            gdf = gdf.set_crs("EPSG:4326")
-        elif str(gdf.crs) != "EPSG:4326":
-            gdf = gdf.to_crs("EPSG:4326")
-
-        return gdf
-
-    @staticmethod
-    def _normalize_azimuth_deg(value: float) -> float:
-        return float(value) % 360.0
-
-    def _build_start_point(
-        self,
-        source_lon: float,
-        source_lat: float,
-        azimuth_deg: float,
-        offset_m: float,
-    ) -> tuple[float, float]:
-        return geodesic_forward_point(
-            source_lon,
-            source_lat,
-            azimuth_deg,
-            offset_m,
-        )
-
-    def _build_ray(
-        self,
-        start_lon: float,
-        start_lat: float,
-        azimuth_deg: float,
-    ) -> LineString:
-        return build_geodesic_linestring(
-            lon=start_lon,
-            lat=start_lat,
-            azimuth_deg=azimuth_deg,
-            total_length_m=self.config.default_fetch_m,
-            step_m=self.config.geodesic_step_m,
-            max_segments=self.config.max_segments_per_ray,
-        )
-
-    def _find_first_intersection(
-        self,
-        ray: LineString,
-        start_lon: float,
-        start_lat: float,
-    ) -> Point | None:
-        candidates = self.index.query(ray)
-        if not candidates:
-            return None
-
-        nearest_point: Point | None = None
-        nearest_dist: float | None = None
-
-        for coastline in candidates:
-            if coastline is None or coastline.is_empty:
-                continue
-
-            if not coastline.intersects(ray):
-                continue
-
-            inter = ray.intersection(coastline)
-            if inter.is_empty:
-                continue
-
-            points = extract_points_from_intersection(inter)
-            if not points:
-                continue
-
-            for pt in points:
-                dist = geodesic_distance_m(
-                    start_lon,
-                    start_lat,
-                    float(pt.x),
-                    float(pt.y),
-                )
-
-                if dist <= 1e-9:
-                    continue
-
-                if nearest_dist is None or dist < nearest_dist:
-                    nearest_dist = dist
-                    nearest_point = pt
-
-        return nearest_point
-
-
-class WindFetchCalculator(_BaseFetchCalculator):
+def _ray_end_lonlat(
+    result: WindFetchResult | MultiDirectionFetchResult,
+    azimuth_attr: str = "ray_azimuth_deg",
+    step_m: float = 1_000.0,
+    max_segments: int = 200,
+) -> tuple[float, float]:
     """
-    Вычисляет длину трассы от береговой точки до первого пересечения с береговой линией
-    по одному азимуту, заданному в атрибутах точки.
-
-    Азимут трактуется как обычный bearing:
-    - 0 = север
-    - 90 = восток
-    - 180 = юг
-    - 270 = запад
+    Возвращает (lon, lat) конечной точки луча.
+    Если попадание найдено — берёт hit_lon/hit_lat,
+    иначе вычисляет точку по максимальной длине луча.
+    Вызывается ОДИН РАЗ на строку, результат переиспользуется.
     """
-
-    NORMAL_AZIMUTH_FIELDS = (
-        "normal_azimuth_deg",
-        "normal_azimuth",
-        "azimuth_deg",
-        "azimuth",
-        "bearing_deg",
-        "bearing",
+    if result.hit_lon is not None and result.hit_lat is not None:
+        return float(result.hit_lon), float(result.hit_lat)
+    azimuth = getattr(result, azimuth_attr)
+    max_dist = step_m * max_segments
+    return geodesic_forward_point(
+        result.start_point_lon,
+        result.start_point_lat,
+        azimuth,
+        max_dist,
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Базовый класс
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _BaseFetchCalculator:
+    """Общая инфраструктура загрузки данных."""
+
+    def __init__(self, config: WindFetchConfig) -> None:
+        self.config = config
+
+    # ── загрузка / нормализация CRS ─────────────────────────────────────────
+
+    @staticmethod
+    def _load_gdf_4326(path: str | Path) -> gpd.GeoDataFrame:
+        gdf = gpd.read_file(path)
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4326")
+        elif str(gdf.crs).upper() != "EPSG:4326":
+            gdf = gdf.to_crs("EPSG:4326")
+        return gdf
+
+    def _load_coastline(self, path: str | Path) -> gpd.GeoDataFrame:
+        return self._load_gdf_4326(path)
+
+    def _load_points(self, path: str | Path) -> gpd.GeoDataFrame:
+        return self._load_gdf_4326(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Однонаправленный калькулятор (WindFetchCalculator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WindFetchCalculator(_BaseFetchCalculator):
+    """Трассирует единственный луч от каждой точки по заданному азимуту."""
+
     def __init__(
         self,
-        paths: WindFetchPaths,
+        coastline_path: str | Path,
+        points_path: str | Path,
+        azimuth_deg: float,
         config: WindFetchConfig | None = None,
     ) -> None:
-        super().__init__(
-            paths=paths,
-            config=config,
-            dataset_name="wind_fetch_coastline",
-        )
-        self.azimuth_field = self._detect_azimuth_field()
+        super().__init__(config or WindFetchConfig())
+        self.azimuth_deg = float(azimuth_deg) % 360.0
+        self._coastline_gdf = self._load_coastline(coastline_path)
+        self._points_gdf = self._load_points(points_path)
+        self._index = CoastlineSpatialIndex(self._coastline_gdf)
 
-        logger.info(
-            f"{self.__class__.__name__}: azimuth_field={self.azimuth_field}"
-        )
+    # ── расчёт ──────────────────────────────────────────────────────────────
 
-    def _detect_azimuth_field(self) -> str:
-        for field in self.NORMAL_AZIMUTH_FIELDS:
-            if field in self.points_gdf.columns:
-                return field
-
-        raise ValueError(
-            f"Points file must contain one of azimuth fields: {self.NORMAL_AZIMUTH_FIELDS}"
-        )
-
-    def calculate(self, offset_m: float | None = None) -> list[WindFetchResult]:
-        offset = self.config.default_offset_m if offset_m is None else float(offset_m)
-        azimuth_values = self.points_gdf[self.azimuth_field].to_numpy()
-
+    def calculate(self) -> list[WindFetchResult]:
         results: list[WindFetchResult] = []
-        append_result = results.append
-
-        for idx, (geom, azimuth_raw) in enumerate(zip(self._point_geometries, azimuth_values, strict=False), start=1):
-            if geom is None or geom.is_empty:
-                continue
-
-            source_lon = float(geom.x)
-            source_lat = float(geom.y)
-            azimuth_deg = self._normalize_azimuth_deg(float(azimuth_raw))
-
-            start_lon, start_lat = self._build_start_point(
-                source_lon=source_lon,
-                source_lat=source_lat,
-                azimuth_deg=azimuth_deg,
-                offset_m=offset,
-            )
-
-            ray = self._build_ray(
-                start_lon=start_lon,
-                start_lat=start_lat,
-                azimuth_deg=azimuth_deg,
-            )
-
-            hit_point = self._find_first_intersection(
-                ray=ray,
-                start_lon=start_lon,
-                start_lat=start_lat,
-            )
-
-            if hit_point is None:
-                append_result(
-                    WindFetchResult(
-                        point_id=idx,
-                        source_point_lon=source_lon,
-                        source_point_lat=source_lat,
-                        start_point_lon=start_lon,
-                        start_point_lat=start_lat,
-                        normal_azimuth_deg=azimuth_deg,
-                        ray_azimuth_deg=azimuth_deg,
-                        fetch_length_m=self.config.default_fetch_m,
-                        hit_found=False,
-                        hit_lon=None,
-                        hit_lat=None,
-                        used_default_value=True,
-                    )
-                )
-                continue
-
-            hit_lon = float(hit_point.x)
-            hit_lat = float(hit_point.y)
-            fetch_length_m = geodesic_distance_m(
-                start_lon,
-                start_lat,
-                hit_lon,
-                hit_lat,
-            )
-
-            append_result(
-                WindFetchResult(
-                    point_id=idx,
-                    source_point_lon=source_lon,
-                    source_point_lat=source_lat,
-                    start_point_lon=start_lon,
-                    start_point_lat=start_lat,
-                    normal_azimuth_deg=azimuth_deg,
-                    ray_azimuth_deg=azimuth_deg,
-                    fetch_length_m=fetch_length_m,
-                    hit_found=True,
-                    hit_lon=hit_lon,
-                    hit_lat=hit_lat,
-                    used_default_value=False,
-                )
-            )
-
-        logger.success(f"Calculated wind fetch for {len(results)} points")
+        for _, row in self._points_gdf.iterrows():
+            result = self._trace_ray(row)
+            results.append(result)
         return results
 
-    def to_dataframe(self, results: Sequence[WindFetchResult]) -> pd.DataFrame:
-        return pd.DataFrame.from_records(
-            {
+    def _trace_ray(self, row: pd.Series) -> WindFetchResult:
+        source_lon = float(row.geometry.x)
+        source_lat = float(row.geometry.y)
+        point_id = int(row.get("point_id", row.name))
+
+        start_lon, start_lat = geodesic_forward_point(
+            source_lon, source_lat, self.azimuth_deg, self.config.offset_m
+        )
+
+        hit_lon: float | None = None
+        hit_lat: float | None = None
+        hit_found = False
+        used_default = False
+
+        for seg in range(self.config.max_segments_per_ray):
+            next_lon, next_lat = geodesic_forward_point(
+                start_lon, start_lat, self.azimuth_deg, self.config.geodesic_step_m
+            )
+            segment = LineString([(start_lon, start_lat), (next_lon, next_lat)])
+            candidates = self._index.query(segment)
+            for geom in candidates:
+                inter = segment.intersection(geom)
+                if not inter.is_empty:
+                    if isinstance(inter, Point):
+                        hit_lon, hit_lat = inter.x, inter.y
+                    else:
+                        pt = inter.geoms[0] if hasattr(inter, "geoms") else inter
+                        hit_lon, hit_lat = pt.x, pt.y
+                    hit_found = True
+                    break
+            if hit_found:
+                break
+            start_lon, start_lat = next_lon, next_lat
+        else:
+            used_default = True
+
+        fetch_length_m: float
+        if hit_found and hit_lon is not None and hit_lat is not None:
+            _, _, fetch_length_m = _GEOD.inv(
+                row.geometry.x, row.geometry.y, hit_lon, hit_lat
+            )
+        else:
+            fetch_length_m = self.config.geodesic_step_m * self.config.max_segments_per_ray
+
+        return WindFetchResult(
+            point_id=point_id,
+            source_point_lon=source_lon,
+            source_point_lat=source_lat,
+            start_point_lon=float(row.geometry.x),
+            start_point_lat=float(row.geometry.y),
+            ray_azimuth_deg=self.azimuth_deg,
+            normal_azimuth_deg=float(row.get("normal_azimuth_deg", self.azimuth_deg)),
+            fetch_length_m=fetch_length_m,
+            hit_found=hit_found,
+            hit_lon=hit_lon,
+            hit_lat=hit_lat,
+            used_default_value=used_default,
+        )
+
+    # ── экспорт ─────────────────────────────────────────────────────────────
+
+    def to_rays_geodataframe(self, results: list[WindFetchResult]) -> gpd.GeoDataFrame:
+        rows: list[dict[str, Any]] = []
+        for r in results:
+            end_lon, end_lat = _ray_end_lonlat(
+                r,
+                azimuth_attr="ray_azimuth_deg",
+                step_m=self.config.geodesic_step_m,
+                max_segments=self.config.max_segments_per_ray,
+            )
+            rows.append({
                 "point_id": r.point_id,
-                "source_point_lon": r.source_point_lon,
-                "source_point_lat": r.source_point_lat,
-                "start_point_lon": r.start_point_lon,
-                "start_point_lat": r.start_point_lat,
-                "azimuth_deg": r.ray_azimuth_deg,
+                "ray_azimuth_deg": r.ray_azimuth_deg,
+                "normal_azimuth_deg": r.normal_azimuth_deg,
                 "fetch_length_m": r.fetch_length_m,
                 "hit_found": r.hit_found,
-                "hit_lon": r.hit_lon,
-                "hit_lat": r.hit_lat,
                 "used_default_value": r.used_default_value,
-            }
-            for r in results
-        )
-
-    def to_geodataframe(self, results: Sequence[WindFetchResult]) -> gpd.GeoDataFrame:
-        return gpd.GeoDataFrame(
-            (
-                {
-                    "point_id": r.point_id,
-                    "source_lon": r.source_point_lon,
-                    "source_lat": r.source_point_lat,
-                    "start_lon": r.start_point_lon,
-                    "start_lat": r.start_point_lat,
-                    "azimuth_deg": r.ray_azimuth_deg,
-                    "fetch_length_m": r.fetch_length_m,
-                    "hit_found": r.hit_found,
-                    "hit_lon": r.hit_lon,
-                    "hit_lat": r.hit_lat,
-                    "used_default_value": r.used_default_value,
-                    "geometry": Point(r.source_point_lon, r.source_point_lat),
-                }
-                for r in results
-            ),
-            geometry="geometry",
-            crs="EPSG:4326",
-        )
-
-    def to_rays_geodataframe(self, results: Sequence[WindFetchResult]) -> gpd.GeoDataFrame:
-        return gpd.GeoDataFrame(
-            (
-                {
-                    "point_id": r.point_id,
-                    "source_lon": r.source_point_lon,
-                    "source_lat": r.source_point_lat,
-                    "start_lon": r.start_point_lon,
-                    "start_lat": r.start_point_lat,
-                    "end_lon": (
-                        float(r.hit_lon)
-                        if r.hit_lon is not None
-                        else geodesic_forward_point(
-                            r.start_point_lon,
-                            r.start_point_lat,
-                            r.ray_azimuth_deg,
-                            r.fetch_length_m,
-                        )[0]
-                    ),
-                    "end_lat": (
-                        float(r.hit_lat)
-                        if r.hit_lat is not None
-                        else geodesic_forward_point(
-                            r.start_point_lon,
-                            r.start_point_lat,
-                            r.ray_azimuth_deg,
-                            r.fetch_length_m,
-                        )[1]
-                    ),
-                    "azimuth_deg": r.ray_azimuth_deg,
-                    "fetch_length_m": r.fetch_length_m,
-                    "hit_found": r.hit_found,
-                    "hit_lon": r.hit_lon,
-                    "hit_lat": r.hit_lat,
-                    "used_default_value": r.used_default_value,
-                    "geometry": LineString(
-                        [
-                            (r.start_point_lon, r.start_point_lat),
-                            (
-                                float(r.hit_lon)
-                                if r.hit_lon is not None
-                                else geodesic_forward_point(
-                                    r.start_point_lon,
-                                    r.start_point_lat,
-                                    r.ray_azimuth_deg,
-                                    r.fetch_length_m,
-                                )[0],
-                                float(r.hit_lat)
-                                if r.hit_lat is not None
-                                else geodesic_forward_point(
-                                    r.start_point_lon,
-                                    r.start_point_lat,
-                                    r.ray_azimuth_deg,
-                                    r.fetch_length_m,
-                                )[1],
-                            ),
-                        ]
-                    ),
-                }
-                for r in results
-            ),
-            geometry="geometry",
-            crs="EPSG:4326",
-        )
+                "end_lon": end_lon,
+                "end_lat": end_lat,
+                "geometry": LineString([
+                    (r.start_point_lon, r.start_point_lat),
+                    (end_lon, end_lat),
+                ]),
+            })
+        return gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
 
     def save(
         self,
-        results: Sequence[WindFetchResult],
-        output_dir: str | Path | None = None,
-    ) -> dict[str, str]:
-        out_dir = Path(output_dir or self.config.output_dir)
+        results: list[WindFetchResult],
+        out_dir: str | Path,
+    ) -> None:
+        out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         csv_path = out_dir / self.config.output_csv_name
-        points_geojson_path = out_dir / self.config.output_geojson_name
-        rays_geojson_path = out_dir / f"rays_{self.config.output_geojson_name}"
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            if not results:
+                return
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=[f.name for f in WindFetchResult.__dataclass_fields__.values()],
+            )
+            writer.writeheader()
+            for r in results:
+                writer.writerow({
+                    f: getattr(r, f)
+                    for f in WindFetchResult.__dataclass_fields__
+                })
+        logger.success(f"CSV сохранён: {csv_path}")
 
-        self.to_dataframe(results).to_csv(csv_path, index=False)
-        self.to_geodataframe(results).to_file(points_geojson_path, driver="GeoJSON")
-        self.to_rays_geodataframe(results).to_file(rays_geojson_path, driver="GeoJSON")
+        rays_gdf = self.to_rays_geodataframe(results)
+        geojson_path = out_dir / self.config.output_geojson_name
+        rays_gdf.to_file(geojson_path, driver="GeoJSON")
+        logger.success(f"GeoJSON сохранён: {geojson_path}")
 
-        logger.success(
-            f"Saved wind fetch outputs: csv={csv_path}, "
-            f"points={points_geojson_path}, rays={rays_geojson_path}"
-        )
 
-        return {
-            "csv": str(csv_path),
-            "points_geojson": str(points_geojson_path),
-            "rays_geojson": str(rays_geojson_path),
-        }
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Многонаправленный калькулятор (MultiDirectionFetchCalculator)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MultiDirectionFetchCalculator(_BaseFetchCalculator):
     """
-    Считает трассировку для каждой точки по нескольким направлениям.
-
-    По умолчанию направления: 0..359 градусов с шагом 1 градус.
+    Трассирует N равномерно распределённых лучей от каждой точки.
+    Направления в сухопутном секторе пропускаются.
     """
 
     def __init__(
         self,
-        paths: WindFetchPaths,
+        coastline_path: str | Path,
+        points_path: str | Path,
         config: WindFetchConfig | None = None,
     ) -> None:
-        super().__init__(
-            paths=paths,
-            config=config,
-            dataset_name="multi_direction_wind_fetch_coastline",
-        )
+        super().__init__(config or WindFetchConfig())
+        self._coastline_gdf = self._load_coastline(coastline_path)
+        self._points_gdf = self._load_points(points_path)
+        self._index = CoastlineSpatialIndex(self._coastline_gdf)
 
-    @staticmethod
-    def _normalize_azimuths(
-        azimuths: Iterable[float] | None,
-    ) -> list[float]:
-        if azimuths is None:
-            return [float(v) for v in range(360)]
+    def _make_azimuths(self) -> list[float]:
+        step = 360.0 / self.config.n_directions
+        raw = [i * step for i in range(self.config.n_directions)]
+        return normalize_azimuths(raw)
 
-        normalized = sorted({float(v) % 360.0 for v in azimuths})
-        if not normalized:
-            raise ValueError("Azimuth list is empty")
-
-        return normalized
-
-    def calculate(
-        self,
-        azimuths: Iterable[float] | None = None,
-        offset_m: float | None = None,
-    ) -> list[MultiDirectionFetchResult]:
-        azimuth_list = self._normalize_azimuths(azimuths)
-        offset = self.config.default_offset_m if offset_m is None else float(offset_m)
-
-        logger.info(
-            f"Calculating multi-direction fetch: "
-            f"points={len(self.points_gdf)}, directions={len(azimuth_list)}, offset_m={offset}"
-        )
-
+    def calculate(self) -> list[MultiDirectionFetchResult]:
+        azimuths = self._make_azimuths()
         results: list[MultiDirectionFetchResult] = []
-        append_result = results.append
-
-        for point_idx, geom in enumerate(self._point_geometries, start=1):
-            if geom is None or geom.is_empty:
-                continue
-
-            source_lon = float(geom.x)
-            source_lat = float(geom.y)
-
-            for direction_id, azimuth_deg in enumerate(azimuth_list, start=1):
-                start_lon, start_lat = self._build_start_point(
-                    source_lon=source_lon,
-                    source_lat=source_lat,
-                    azimuth_deg=azimuth_deg,
-                    offset_m=offset,
-                )
-
-                ray = self._build_ray(
-                    start_lon=start_lon,
-                    start_lat=start_lat,
-                    azimuth_deg=azimuth_deg,
-                )
-
-                hit_point = self._find_first_intersection(
-                    ray=ray,
-                    start_lon=start_lon,
-                    start_lat=start_lat,
-                )
-
-                if hit_point is None:
-                    append_result(
-                        MultiDirectionFetchResult(
-                            point_id=point_idx,
-                            direction_id=direction_id,
-                            azimuth_deg=azimuth_deg,
-                            source_point_lon=source_lon,
-                            source_point_lat=source_lat,
-                            start_point_lon=start_lon,
-                            start_point_lat=start_lat,
-                            fetch_length_m=self.config.default_fetch_m,
-                            hit_found=False,
-                            hit_lon=None,
-                            hit_lat=None,
-                            used_default_value=True,
-                        )
-                    )
-                    continue
-
-                hit_lon = float(hit_point.x)
-                hit_lat = float(hit_point.y)
-                fetch_length_m = geodesic_distance_m(
-                    start_lon,
-                    start_lat,
-                    hit_lon,
-                    hit_lat,
-                )
-
-                append_result(
-                    MultiDirectionFetchResult(
-                        point_id=point_idx,
-                        direction_id=direction_id,
-                        azimuth_deg=azimuth_deg,
-                        source_point_lon=source_lon,
-                        source_point_lat=source_lat,
-                        start_point_lon=start_lon,
-                        start_point_lat=start_lat,
-                        fetch_length_m=fetch_length_m,
-                        hit_found=True,
-                        hit_lon=hit_lon,
-                        hit_lat=hit_lat,
-                        used_default_value=False,
-                    )
-                )
-
-        logger.success(f"Calculated multi-direction fetch rays: {len(results)}")
+        for _, row in self._points_gdf.iterrows():
+            normal_az = float(row.get("normal_azimuth_deg", 0.0))
+            for dir_id, az in enumerate(azimuths):
+                r = self._trace_one(row, dir_id, az, normal_az)
+                results.append(r)
         return results
 
-    def to_dataframe(self, results: Sequence[MultiDirectionFetchResult]) -> pd.DataFrame:
-        return pd.DataFrame.from_records(
-            {
-                "point_id": r.point_id,
-                "direction_id": r.direction_id,
-                "azimuth_deg": r.azimuth_deg,
-                "source_lon": r.source_point_lon,
-                "source_lat": r.source_point_lat,
-                "start_lon": r.start_point_lon,
-                "start_lat": r.start_point_lat,
-                "fetch_length_m": r.fetch_length_m,
-                "hit_found": r.hit_found,
-                "hit_lon": r.hit_lon,
-                "hit_lat": r.hit_lat,
-                "used_default_value": r.used_default_value,
-            }
-            for r in results
+    def _trace_one(
+        self,
+        row: pd.Series,
+        direction_id: int,
+        azimuth_deg: float,
+        normal_azimuth_deg: float,
+    ) -> MultiDirectionFetchResult:
+        from src.wind_fetch.geometry_utils import is_in_land_sector
+
+        source_lon = float(row.geometry.x)
+        source_lat = float(row.geometry.y)
+        point_id = int(row.get("point_id", row.name))
+
+        skipped = is_in_land_sector(
+            azimuth_deg, normal_azimuth_deg, self.config.half_land_sector_deg
         )
 
-    def to_points_geodataframe(
-        self,
-        results: Sequence[MultiDirectionFetchResult],
-    ) -> gpd.GeoDataFrame:
-        return gpd.GeoDataFrame(
-            (
-                {
-                    "point_id": r.point_id,
-                    "direction_id": r.direction_id,
-                    "azimuth_deg": r.azimuth_deg,
-                    "source_lon": r.source_point_lon,
-                    "source_lat": r.source_point_lat,
-                    "start_lon": r.start_point_lon,
-                    "start_lat": r.start_point_lat,
-                    "fetch_length_m": r.fetch_length_m,
-                    "hit_found": r.hit_found,
-                    "hit_lon": r.hit_lon,
-                    "hit_lat": r.hit_lat,
-                    "used_default_value": r.used_default_value,
-                    "geometry": Point(r.source_point_lon, r.source_point_lat),
-                }
-                for r in results
-            ),
-            geometry="geometry",
-            crs="EPSG:4326",
+        if skipped:
+            return MultiDirectionFetchResult(
+                point_id=point_id,
+                direction_id=direction_id,
+                normal_azimuth_deg=normal_azimuth_deg,
+                azimuth_deg=azimuth_deg,
+                source_point_lon=source_lon,
+                source_point_lat=source_lat,
+                start_point_lon=source_lon,
+                start_point_lat=source_lat,
+                fetch_length_m=self.config.offset_m,
+                hit_found=False,
+                hit_lon=None,
+                hit_lat=None,
+                used_default_value=False,
+                skipped_by_land_sector=True,
+            )
+
+        start_lon, start_lat = geodesic_forward_point(
+            source_lon, source_lat, azimuth_deg, self.config.offset_m
+        )
+
+        hit_lon: float | None = None
+        hit_lat: float | None = None
+        hit_found = False
+        used_default = False
+
+        cur_lon, cur_lat = start_lon, start_lat
+        for _ in range(self.config.max_segments_per_ray):
+            next_lon, next_lat = geodesic_forward_point(
+                cur_lon, cur_lat, azimuth_deg, self.config.geodesic_step_m
+            )
+            segment = LineString([(cur_lon, cur_lat), (next_lon, next_lat)])
+            for geom in self._index.query(segment):
+                inter = segment.intersection(geom)
+                if not inter.is_empty:
+                    if isinstance(inter, Point):
+                        hit_lon, hit_lat = inter.x, inter.y
+                    else:
+                        pt = inter.geoms[0] if hasattr(inter, "geoms") else inter
+                        hit_lon, hit_lat = pt.x, pt.y
+                    hit_found = True
+                    break
+            if hit_found:
+                break
+            cur_lon, cur_lat = next_lon, next_lat
+        else:
+            used_default = True
+
+        if hit_found and hit_lon is not None:
+            _, _, fetch_length_m = _GEOD.inv(source_lon, source_lat, hit_lon, hit_lat)
+        else:
+            fetch_length_m = self.config.geodesic_step_m * self.config.max_segments_per_ray
+
+        return MultiDirectionFetchResult(
+            point_id=point_id,
+            direction_id=direction_id,
+            normal_azimuth_deg=normal_azimuth_deg,
+            azimuth_deg=azimuth_deg,
+            source_point_lon=source_lon,
+            source_point_lat=source_lat,
+            start_point_lon=start_lon,
+            start_point_lat=start_lat,
+            fetch_length_m=fetch_length_m,
+            hit_found=hit_found,
+            hit_lon=hit_lon,
+            hit_lat=hit_lat,
+            used_default_value=used_default,
+            skipped_by_land_sector=False,
         )
 
     def to_rays_geodataframe(
-        self,
-        results: Sequence[MultiDirectionFetchResult],
+        self, results: list[MultiDirectionFetchResult]
     ) -> gpd.GeoDataFrame:
-        return gpd.GeoDataFrame(
-            (
-                {
-                    "point_id": r.point_id,
-                    "direction_id": r.direction_id,
-                    "azimuth_deg": r.azimuth_deg,
-                    "source_lon": r.source_point_lon,
-                    "source_lat": r.source_point_lat,
-                    "start_lon": r.start_point_lon,
-                    "start_lat": r.start_point_lat,
-                    "end_lon": (
-                        float(r.hit_lon)
-                        if r.hit_lon is not None
-                        else geodesic_forward_point(
-                            r.start_point_lon,
-                            r.start_point_lat,
-                            r.azimuth_deg,
-                            r.fetch_length_m,
-                        )[0]
-                    ),
-                    "end_lat": (
-                        float(r.hit_lat)
-                        if r.hit_lat is not None
-                        else geodesic_forward_point(
-                            r.start_point_lon,
-                            r.start_point_lat,
-                            r.azimuth_deg,
-                            r.fetch_length_m,
-                        )[1]
-                    ),
-                    "fetch_length_m": r.fetch_length_m,
-                    "hit_found": r.hit_found,
-                    "hit_lon": r.hit_lon,
-                    "hit_lat": r.hit_lat,
-                    "used_default_value": r.used_default_value,
-                    "geometry": LineString(
-                        [
-                            (r.start_point_lon, r.start_point_lat),
-                            (
-                                float(r.hit_lon)
-                                if r.hit_lon is not None
-                                else geodesic_forward_point(
-                                    r.start_point_lon,
-                                    r.start_point_lat,
-                                    r.azimuth_deg,
-                                    r.fetch_length_m,
-                                )[0],
-                                float(r.hit_lat)
-                                if r.hit_lat is not None
-                                else geodesic_forward_point(
-                                    r.start_point_lon,
-                                    r.start_point_lat,
-                                    r.azimuth_deg,
-                                    r.fetch_length_m,
-                                )[1],
-                            ),
-                        ]
-                    ),
-                }
-                for r in results
-            ),
-            geometry="geometry",
-            crs="EPSG:4326",
-        )
-
-    def save_combined(
-        self,
-        results: Sequence[MultiDirectionFetchResult],
-        output_dir: str | Path | None = None,
-    ) -> dict[str, str]:
-        out_dir = Path(output_dir or self.config.output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        csv_path = out_dir / self.config.multi_output_csv_name
-        points_geojson_path = out_dir / self.config.multi_output_points_name
-        rays_geojson_path = out_dir / self.config.multi_output_rays_name
-
-        self.to_dataframe(results).to_csv(csv_path, index=False)
-        self.to_points_geodataframe(results).to_file(points_geojson_path, driver="GeoJSON")
-        self.to_rays_geodataframe(results).to_file(rays_geojson_path, driver="GeoJSON")
-
-        logger.success(
-            f"Saved combined multi-direction outputs: csv={csv_path}, "
-            f"points={points_geojson_path}, rays={rays_geojson_path}"
-        )
-
-        return {
-            "csv": str(csv_path),
-            "points_geojson": str(points_geojson_path),
-            "rays_geojson": str(rays_geojson_path),
-        }
-
-    def save_split_by_direction(
-        self,
-        results: Sequence[MultiDirectionFetchResult],
-        output_dir: str | Path | None = None,
-    ) -> dict[str, str]:
-        out_dir = Path(output_dir or self.config.output_dir) / self.config.multi_output_split_dirname
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        points_gdf = self.to_points_geodataframe(results)
-        rays_gdf = self.to_rays_geodataframe(results)
-
-        saved: dict[str, str] = {}
-
-        for azimuth_deg in sorted(points_gdf["azimuth_deg"].unique()):
-            az_label = int(round(float(azimuth_deg))) % 360
-
-            points_part = points_gdf[points_gdf["azimuth_deg"] == azimuth_deg].copy()
-            rays_part = rays_gdf[rays_gdf["azimuth_deg"] == azimuth_deg].copy()
-
-            points_path = out_dir / f"points_az_{az_label:03d}.geojson"
-            rays_path = out_dir / f"rays_az_{az_label:03d}.geojson"
-
-            points_part.to_file(points_path, driver="GeoJSON")
-            rays_part.to_file(rays_path, driver="GeoJSON")
-
-            saved[f"points_{az_label:03d}"] = str(points_path)
-            saved[f"rays_{az_label:03d}"] = str(rays_path)
-
-        logger.success(
-            f"Saved split multi-direction outputs to {out_dir} "
-            f"for {len(points_gdf['azimuth_deg'].unique())} directions"
-        )
-        return saved
+        rows: list[dict[str, Any]] = []
+        for r in results:
+            end_lon, end_lat = _ray_end_lonlat(
+                r,
+                azimuth_attr="azimuth_deg",
+                step_m=self.config.geodesic_step_m,
+                max_segments=self.config.max_segments_per_ray,
+            )
+            rows.append({
+                "point_id": r.point_id,
+                "direction_id": r.direction_id,
+                "normal_azimuth_deg": r.normal_azimuth_deg,
+                "azimuth_deg": r.azimuth_deg,
+                "fetch_length_m": r.fetch_length_m,
+                "hit_found": r.hit_found,
+                "skipped_by_land_sector": r.skipped_by_land_sector,
+                "used_default_value": r.used_default_value,
+                "end_lon": end_lon,
+                "end_lat": end_lat,
+                "geometry": LineString([
+                    (r.start_point_lon, r.start_point_lat),
+                    (end_lon, end_lat),
+                ]),
+            })
+        return gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")

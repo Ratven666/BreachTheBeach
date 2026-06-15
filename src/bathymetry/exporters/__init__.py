@@ -1,6 +1,6 @@
 from .base import BathymetryExportStrategy, ProfileExportStrategy
-from .csv_profile_exporter import CSVProfileExporter
-from .netcdf_exporter import NetCDFBathymetryExporter
+from .CSVProfileExporter import CSVProfileExporter
+from .NetCDFBathymetryExporter import NetCDFBathymetryExporter
 
 __all__ = [
     "BathymetryExportStrategy",

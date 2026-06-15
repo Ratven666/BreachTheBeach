@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.base.BBox import BBox
-from src.bathymetry.loaders.base import BathymetryLoader
-from src.bathymetry.loaders.emodnet_loader import EMODnetBathymetryLoader
+from src.bathymetry.loaders.BathymetryLoader import BathymetryLoader
+from src.bathymetry.loaders.EMODnetBathymetryLoader import EMODnetBathymetryLoader
 from src.bathymetry.loaders.gebco_opentopography_loader import GEBCOOpenTopographyLoader
 
 

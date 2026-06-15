@@ -136,36 +136,28 @@ class WeatherLayerWrapper:
         for _, row in self._assigned_gdf.iterrows():
             yield self._row_to_weather_point(row)
 
-    def export_point_files(
-        self,
-        assigned_gdf: gpd.GeoDataFrame | None,
-        output_dir: str | Path,
-        coast_id_column: str = "point_id",
-        driver: str = "GeoJSON",
-    ) -> list[Path]:
+    def export_point_files(self, assigned_gdf, output_dir, coast_id_column="point_id", driver="GeoJSON"):
         if assigned_gdf is None:
             assigned_gdf = self.get_assigned_gdf()
-
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-
         if assigned_gdf.empty:
             logger.warning("Assigned GeoDataFrame is empty; no point files exported.")
             return []
 
-        exported_files: list[Path] = []
+        # Строим словарь point_id → WeatherPoint за один проход (O(n))
+        points_by_id = {wp.point_id: wp for wp in self}
 
+        exported_files = []
         for row in assigned_gdf.itertuples(index=False):
             row_dict = row._asdict()
             point_id = row_dict.get(coast_id_column)
             point_slug = slugify(point_id)
-
             point_dir = output_dir / point_slug
             point_dir.mkdir(parents=True, exist_ok=True)
 
-            point_obj = self.get_point(point_id)
+            point_obj = points_by_id[point_id]  # O(1)
             point_gdf = point_obj.to_timeseries_gdf(crs=assigned_gdf.crs)
-
             out_path = point_dir / f"{point_slug}.geojson"
             export_gdf(point_gdf, out_path, driver=driver)
             exported_files.append(out_path)
@@ -348,7 +340,17 @@ class WeatherLayerWrapper:
         ])
         tree = cKDTree(metric_coords)
 
-        dates = np.asarray(weather_gdf.iloc[0]["dates"], dtype=object)
+        all_dates = weather_gdf["dates"].tolist()
+        ref_dates = all_dates[0]
+        for i, row_dates in enumerate(all_dates[1:], start=1):
+            if len(row_dates) != len(ref_dates):
+                raise ValueError(
+                    f"Weather grid row {i} has {len(row_dates)} timestamps, "
+                    f"expected {len(ref_dates)} (from row 0). "
+                    "All grid points must share the same time axis."
+                )
+        dates = np.asarray(ref_dates, dtype=object)
+
         speed = np.vstack(weather_gdf["wind_speed"].to_list()).astype(np.float32)
         direction = np.vstack(weather_gdf["wind_dir"].to_list()).astype(np.float32)
 
@@ -505,10 +507,7 @@ class WeatherLayerWrapper:
         if value is None:
             return None
         try:
-            angle = float(value) % 360.0
-            if angle < 0:
-                angle += 360.0
-            return angle
+            return float(value) % 360.0
         except Exception:
             return None
 

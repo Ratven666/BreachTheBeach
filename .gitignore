@@ -238,3 +238,7 @@ coastliту_simlifier_test.py
 bathymetry_test.py
 
 test.py
+
+nvrsk_calc/
+/vyborg/
+/compare_bathymetry_sources.py

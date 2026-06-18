@@ -223,6 +223,22 @@ data/
 
 output/
 
-test.py
+coasline_dataset_merger.py
 
 base_var.py
+
+secret/
+
+.DS_Store
+
+multy_ray_trcer_test.py
+
+coastliту_simlifier_test.py
+
+bathymetry_test.py
+
+test.py
+
+nvrsk_calc/
+/vyborg/
+/compare_bathymetry_sources.py

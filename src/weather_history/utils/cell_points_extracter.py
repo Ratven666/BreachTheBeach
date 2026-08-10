@@ -8,7 +8,7 @@ from shapely.geometry import box
 # ---------------------------------------------------------------------
 # ПАРАМЕТРЫ
 # ---------------------------------------------------------------------
-INPUT_FILE = Path("/Users/mikhail_vystrchil/Documents/MY_PROGRAMMS/BreachTheBeach/data/NVRSK_BlackSeaCoastlineS2Coast2023.geojson")
+INPUT_FILE = Path("/Users/mikhail_vystrchil/Documents/MY_PROGRAMMS/BreachTheBeach/data/NVRSKCoastTestW.geojson")
 
 OUTPUT_CELLS = Path("era5_coastal_cells_025deg.geojson")
 OUTPUT_POINTS = Path("era5_coastal_grid_nodes_025deg.geojson")

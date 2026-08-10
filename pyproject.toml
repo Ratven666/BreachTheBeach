@@ -25,6 +25,7 @@ plotly = "^6.8.0"
 pyproj = "^3.7.0"
 pydap = "^3.5.9"
 rasterio = "^1.5.0"
+sqlalchemy = "^2.0.51"
 
 [build-system]
 requires = ["poetry-core"]

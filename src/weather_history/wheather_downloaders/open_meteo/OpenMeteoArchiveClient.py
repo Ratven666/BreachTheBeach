@@ -1,3 +1,5 @@
+"""src/weather_history/wheather_downloaders/open_meteo/OpenMeteoArchiveClient.py"""
+
 from __future__ import annotations
 
 from urllib.parse import urlencode
@@ -10,7 +12,11 @@ from .models import GridPoint
 class OpenMeteoArchiveClient:
     BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
-    def __init__(self, user_agent: str = "BreachTheBeach/0.1.0", timeout: float = 120.0) -> None:
+    def __init__(
+        self,
+        user_agent: str = "BreachTheBeach/0.1.0",
+        timeout: float = 120.0,
+    ) -> None:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
         self.timeout = timeout
@@ -34,6 +40,8 @@ class OpenMeteoArchiveClient:
             "timezone": timezone,
             "models": model,
             "cell_selection": cell_selection,
+            # Единица фиксирована во всей компактной БД; не хранится в строках.
+            "wind_speed_unit": "kmh",
         }
 
     def fetch(
@@ -55,7 +63,6 @@ class OpenMeteoArchiveClient:
             timezone=timezone,
             cell_selection=cell_selection,
         )
-
         response = self.session.get(self.BASE_URL, params=params, timeout=self.timeout)
         response.raise_for_status()
 
@@ -63,5 +70,4 @@ class OpenMeteoArchiveClient:
         if isinstance(payload, dict) and payload.get("error"):
             raise RuntimeError(payload.get("reason", "Open-Meteo returned an error"))
 
-        source_url = f"{self.BASE_URL}?{urlencode(params)}"
-        return payload, source_url
+        return payload, f"{self.BASE_URL}?{urlencode(params)}"

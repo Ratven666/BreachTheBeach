@@ -23,6 +23,8 @@ class WeatherDownloadConfig:
     daily_variables: tuple[str, ...] = field(
         default_factory=lambda: (
             "wind_speed_10m_max",
+            "wind_speed_10m_mean",
+            "wind_gusts_10m_max",
             "wind_direction_10m_dominant",
         )
     )

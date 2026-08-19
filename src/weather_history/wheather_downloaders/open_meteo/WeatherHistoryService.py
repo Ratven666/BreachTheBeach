@@ -210,6 +210,13 @@ class WeatherHistoryService:
             daily = payload.get("daily", {})
             daily_units = payload.get("daily_units", {})
 
+            def dump(variable: str) -> str:
+                return json.dumps(
+                    daily.get(variable, []),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+
             rows.append(
                 {
                     "point_id": index,
@@ -222,18 +229,14 @@ class WeatherHistoryService:
                     "tz_abbr": payload.get("timezone_abbreviation"),
                     "start_date": start_date,
                     "end_date": end_date,
-                    "dates": json.dumps(daily.get("time", []), ensure_ascii=False, separators=(",", ":")),
-                    "wind_speed": json.dumps(
-                        daily.get("wind_speed_10m_max", []),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                    "wind_dir": json.dumps(
-                        daily.get("wind_direction_10m_dominant", []),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                    "ws_unit": daily_units.get("wind_speed_10m_max"),
+                    "dates": dump("time"),
+                    "wind_speed_max": dump("wind_speed_10m_max"),
+                    "wind_speed_mean": dump("wind_speed_10m_mean"),
+                    "wind_gust_max": dump("wind_gusts_10m_max"),
+                    "wind_dir": dump("wind_direction_10m_dominant"),
+                    "ws_max_unit": daily_units.get("wind_speed_10m_max"),
+                    "ws_mean_unit": daily_units.get("wind_speed_10m_mean"),
+                    "wg_max_unit": daily_units.get("wind_gusts_10m_max"),
                     "wd_unit": daily_units.get("wind_direction_10m_dominant"),
                     "ring_y": point.ring_y,
                     "ring_x": point.ring_x,

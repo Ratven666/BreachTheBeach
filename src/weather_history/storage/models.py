@@ -4,8 +4,9 @@ src/weather_history/storage/models.py
 ORM-модели для хранения данных о ветре (Open-Meteo).
 
 Компромиссная схема без избыточного копирования:
-- Скорость и направление ветра хранятся ВМЕСТЕ в одной строке
-  WeatherDayModel (один узел сетки + одна дата = одна строка).
+- Скорость (максимум и среднее), порывы и направление ветра хранятся
+  ВМЕСТЕ в одной строке WeatherDayModel (один узел сетки + одна дата =
+  одна строка).
 - Источник данных (модель реанализа, например "era5") и единицы
   измерения (ws_unit, wd_unit) вынесены в отдельный справочник
   WeatherSourceModel — иначе одни и те же строки "era5", "km/h", "°"
@@ -15,7 +16,8 @@ ORM-модели для хранения данных о ветре (Open-Meteo)
 - DownloadSegmentModel хранит только метаданные скачанного диапазона,
   без копии самих значений ветра (они уже лежат в WeatherDayModel).
 
-Порывы ветра (wind_gusts_10m_max) в схему не входят.
+Порывы ветра (wind_gusts_10m_max) и средняя скорость (wind_speed_10m_mean)
+теперь входят в схему как отдельные колонки WeatherDayModel.
 
 JSON-тип из SQLAlchemy работает одинаково на SQLite и PostgreSQL, поэтому
 схема не требует изменений при переходе с sqlite:/// на postgresql+psycopg://.
@@ -49,6 +51,9 @@ class WeatherSourceModel(Base):
     "era5" / "km/h" / "°" в каждой суточной записи — единицы измерения
     и источник модели практически всегда фиксированы для всего набора
     данных, поэтому хранение их построчно было бы избыточным копированием.
+
+    Порывы измеряются в тех же единицах, что и скорость ветра (ws_unit),
+    отдельная колонка для единиц порывов не нужна.
     """
 
     __tablename__ = "weather_sources"
@@ -107,9 +112,10 @@ class GridPointModel(Base):
 
 class WeatherDayModel(Base):
     """
-    Одна суточная запись ветра для одного узла сетки: скорость и направление
-    хранятся в одной строке. Источник данных и единицы измерения не
-    дублируются построчно — только ссылка source_id на WeatherSourceModel.
+    Одна суточная запись ветра для одного узла сетки: максимальная и средняя
+    скорость, максимальный порыв и направление хранятся в одной строке.
+    Источник данных и единицы измерения не дублируются построчно — только
+    ссылка source_id на WeatherSourceModel.
     """
 
     __tablename__ = "weather_days"
@@ -131,6 +137,8 @@ class WeatherDayModel(Base):
     obs_date: Mapped[date] = mapped_column(Date, nullable=False)
 
     wind_speed_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wind_speed_mean: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wind_gust_max: Mapped[float | None] = mapped_column(Float, nullable=True)
     wind_direction: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (

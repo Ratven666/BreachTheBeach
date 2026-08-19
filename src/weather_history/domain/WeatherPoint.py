@@ -22,16 +22,20 @@ class WeatherTimeSeriesRow:
     """Одна строка тайм-серии погодной точки."""
     point_id: Any
     date: str | None
-    wind_speed: float | None
+    wind_speed_max: float | None
+    wind_speed_mean: float | None
+    wind_gust_max: float | None
     wind_dir: float | None
-    ws_unit: str | None
+    ws_max_unit: str | None
+    ws_mean_unit: str | None
+    wg_max_unit: str | None
     wd_unit: str | None
     geometry: Point
 
 
-# Внешний кэш: (point_id, nsector) → WindRose
+# Внешний кэш: (point_id, nsector, speed_field) → WindRose
 # Вынесен ЗА пределы датакласса, чтобы не нарушать контракт frozen=True
-_WIND_ROSE_CACHE: dict[tuple[Any, int], WindRose] = {}
+_WIND_ROSE_CACHE: dict[tuple[Any, int, str], WindRose] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,35 +53,60 @@ class WeatherPoint:
     source_req_lon: float | None
 
     dates: tuple[str | None, ...]
-    wind_speed: tuple[float | None, ...]
+    wind_speed_max: tuple[float | None, ...]
+    wind_speed_mean: tuple[float | None, ...]
+    wind_gust_max: tuple[float | None, ...]
     wind_dir: tuple[float | None, ...]
 
-    ws_unit: str | None
+    ws_max_unit: str | None
+    ws_mean_unit: str | None
+    wg_max_unit: str | None
     wd_unit: str | None
     start_date: Any
     end_date: Any
 
     # ── wind rose ──────────────────────────────────────────────────────────
 
-    def build_wind_rose(self, nsector: int = 16) -> WindRose:
-        key = (self.point_id, nsector)
+    def build_wind_rose(self, nsector: int = 16, speed_field: str = "mean") -> WindRose:
+        key = (self.point_id, nsector, speed_field)
         if key in _WIND_ROSE_CACHE:
             return _WIND_ROSE_CACHE[key]
-        speeds, directions = self._valid_speed_dir_arrays()
+        speeds, directions = self._valid_speed_dir_arrays(speed_field=speed_field)
         rose = WindRoseBuilder(nsector=nsector).build(speeds, directions)
         _WIND_ROSE_CACHE[key] = rose
         return rose
 
     @property
     def wind_rose(self) -> WindRose:
-        return self.build_wind_rose(nsector=16)
+        """Роза ветров по средней скорости — стандартная климатологическая картина."""
+        return self.build_wind_rose(nsector=16, speed_field="mean")
+
+    @property
+    def wind_rose_max(self) -> WindRose:
+        """Роза ветров по суточному максимуму средней скорости."""
+        return self.build_wind_rose(nsector=16, speed_field="max")
+
+    @property
+    def wind_rose_gust(self) -> WindRose:
+        """Роза ветров по порывам — для оценки экстремальной ветровой нагрузки."""
+        return self.build_wind_rose(nsector=16, speed_field="gust")
 
     # ── вспомогательные ───────────────────────────────────────────────────
 
-    def _valid_speed_dir_arrays(self) -> tuple[np.ndarray, np.ndarray]:
+    def _speed_series(self, speed_field: str) -> tuple[float | None, ...]:
+        if speed_field == "mean":
+            return self.wind_speed_mean
+        if speed_field == "max":
+            return self.wind_speed_max
+        if speed_field == "gust":
+            return self.wind_gust_max
+        raise ValueError(f"Unsupported speed_field: {speed_field}")
+
+    def _valid_speed_dir_arrays(self, speed_field: str = "mean") -> tuple[np.ndarray, np.ndarray]:
+        speed_series = self._speed_series(speed_field)
         paired = [
             (s, d)
-            for s, d in zip(self.wind_speed, self.wind_dir)
+            for s, d in zip(speed_series, self.wind_dir)
             if s is not None and d is not None
         ]
         if not paired:
@@ -91,13 +120,23 @@ class WeatherPoint:
             WeatherTimeSeriesRow(
                 point_id=self.point_id,
                 date=d,
-                wind_speed=s,
+                wind_speed_max=ws_max,
+                wind_speed_mean=ws_mean,
+                wind_gust_max=wg_max,
                 wind_dir=wd,
-                ws_unit=self.ws_unit,
+                ws_max_unit=self.ws_max_unit,
+                ws_mean_unit=self.ws_mean_unit,
+                wg_max_unit=self.wg_max_unit,
                 wd_unit=self.wd_unit,
                 geometry=self.geometry,
             )
-            for d, s, wd in zip(self.dates, self.wind_speed, self.wind_dir)
+            for d, ws_max, ws_mean, wg_max, wd in zip(
+                self.dates,
+                self.wind_speed_max,
+                self.wind_speed_mean,
+                self.wind_gust_max,
+                self.wind_dir,
+            )
         ]
 
     def to_timeseries_gdf(self, crs: Any = "EPSG:4326") -> gpd.GeoDataFrame:
@@ -105,9 +144,13 @@ class WeatherPoint:
             {
                 "point_id": r.point_id,
                 "date": r.date,
-                "wind_speed": r.wind_speed,
+                "wind_speed_max": r.wind_speed_max,
+                "wind_speed_mean": r.wind_speed_mean,
+                "wind_gust_max": r.wind_gust_max,
                 "wind_dir": r.wind_dir,
-                "ws_unit": r.ws_unit,
+                "ws_max_unit": r.ws_max_unit,
+                "ws_mean_unit": r.ws_mean_unit,
+                "wg_max_unit": r.wg_max_unit,
                 "wd_unit": r.wd_unit,
                 "geometry": r.geometry,
             }
@@ -116,14 +159,18 @@ class WeatherPoint:
         return gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
 
     def to_summary_series(self) -> pd.Series:
-        speeds, dirs = self._valid_speed_dir_arrays()
+        mean_speeds, _ = self._valid_speed_dir_arrays(speed_field="mean")
+        max_speeds, _ = self._valid_speed_dir_arrays(speed_field="max")
+        gusts, _ = self._valid_speed_dir_arrays(speed_field="gust")
+
         return pd.Series({
             "point_id": self.point_id,
             "lat": self.geometry.y,
             "lon": self.geometry.x,
-            "n_records": len(speeds),
-            "mean_speed": float(np.mean(speeds)) if len(speeds) > 0 else None,
-            "max_speed": float(np.max(speeds)) if len(speeds) > 0 else None,
+            "n_records": len(mean_speeds),
+            "mean_speed": float(np.mean(mean_speeds)) if len(mean_speeds) > 0 else None,
+            "max_speed": float(np.max(max_speeds)) if len(max_speeds) > 0 else None,
+            "max_gust": float(np.max(gusts)) if len(gusts) > 0 else None,
             "source_grid_point_id": self.source_grid_point_id,
             "weather_distance_m": self.weather_distance_m,
         })

@@ -3,12 +3,14 @@ src/weather_history/storage/weather_repository.py
 
 Единая точка доступа к данным о ветре через БД:
 - скачивание из Open-Meteo с проверкой "что уже скачано" (не дублирует запросы);
-- сохранение скорости И направления ветра в одной строке WeatherDayModel;
+- сохранение максимальной и средней скорости, порывов и направления ветра
+  в одной строке WeatherDayModel;
 - источник данных (модель реанализа) и единицы измерения вынесены в
   справочник WeatherSourceModel и не копируются в каждую суточную запись;
 - чтение временных рядов по узлу сетки, по cell_id или по произвольной точке.
 
-Порывы ветра (wind_gusts_10m_max) не запрашиваются и не хранятся.
+Порывы ветра (wind_gusts_10m_max) и средняя скорость (wind_speed_10m_mean)
+запрашиваются и хранятся вместе с максимальной скоростью и направлением.
 
 Работает на SQLite и PostgreSQL без изменения кода — только через DATABASE_URL.
 """
@@ -40,11 +42,18 @@ from src.weather_history.wheather_downloaders.open_meteo.OpenMeteoArchiveClient 
 from src.weather_history.wheather_downloaders.open_meteo.models import GridPoint
 
 # ──────────────────────────────────────────────────────────────────────────
-# Скорость и направление ветра. Порывы (wind_gusts_10m_max) не запрашиваются.
+# Максимальная и средняя скорость, порывы и направление ветра.
 # ──────────────────────────────────────────────────────────────────────────
-WIND_SPEED_VAR = "wind_speed_10m_max"
+WIND_SPEED_MAX_VAR = "wind_speed_10m_max"
+WIND_SPEED_MEAN_VAR = "wind_speed_10m_mean"
+WIND_GUST_MAX_VAR = "wind_gusts_10m_max"
 WIND_DIRECTION_VAR = "wind_direction_10m_dominant"
-DAILY_VARIABLES: tuple[str, ...] = (WIND_SPEED_VAR, WIND_DIRECTION_VAR)
+DAILY_VARIABLES: tuple[str, ...] = (
+    WIND_SPEED_MAX_VAR,
+    WIND_SPEED_MEAN_VAR,
+    WIND_GUST_MAX_VAR,
+    WIND_DIRECTION_VAR,
+)
 
 
 @dataclass(frozen=True)
@@ -244,7 +253,7 @@ class WeatherRepository:
         end_date: str,
         model: str | None = None,
     ) -> list[dict]:
-        """Временной ряд скорости и направления ветра для узла сетки по координатам."""
+        """Временной ряд скорости (максимум/среднее), порывов и направления ветра по координатам узла сетки."""
         model = model or self.settings.model
         start = self._parse_date(start_date)
         end = self._parse_date(end_date)
@@ -273,7 +282,7 @@ class WeatherRepository:
         """
         Находит ближайший к заданной точке узел сетки (простая евклидова
         близость в градусах — достаточно для регулярной сетки 0.25°)
-        и возвращает его временной ряд скорости и направления ветра.
+        и возвращает его временной ряд ветра.
         """
         model = model or self.settings.model
         start = self._parse_date(start_date)
@@ -306,7 +315,7 @@ class WeatherRepository:
         end_date: str,
         model: str | None = None,
     ) -> list[dict]:
-        """Временной ряд скорости и направления ветра по cell_id из файла точек."""
+        """Временной ряд ветра по cell_id из файла точек."""
         model = model or self.settings.model
         start = self._parse_date(start_date)
         end = self._parse_date(end_date)
@@ -339,6 +348,8 @@ class WeatherRepository:
             {
                 "date": day.obs_date.isoformat(),
                 "wind_speed_max": day.wind_speed_max,
+                "wind_speed_mean": day.wind_speed_mean,
+                "wind_gust_max": day.wind_gust_max,
                 "wind_direction": day.wind_direction,
                 "model": source.model,
                 "ws_unit": source.ws_unit,
@@ -518,12 +529,14 @@ class WeatherRepository:
         daily = payload.get("daily", {})
         daily_units = payload.get("daily_units", {})
         times = daily.get("time", [])
-        speeds = daily.get(WIND_SPEED_VAR, [])
+        speeds_max = daily.get(WIND_SPEED_MAX_VAR, [])
+        speeds_mean = daily.get(WIND_SPEED_MEAN_VAR, [])
+        gusts_max = daily.get(WIND_GUST_MAX_VAR, [])
         directions = daily.get(WIND_DIRECTION_VAR, [])
 
-        ws_unit = daily_units.get(WIND_SPEED_VAR)
+        ws_unit = daily_units.get(WIND_SPEED_MAX_VAR)
         wd_unit = daily_units.get(WIND_DIRECTION_VAR)
-        variables_key = "wind_speed_direction"
+        variables_key = "ws_max_mean_gust_dir"
 
         source_id = self._get_or_create_source_id(
             model=self.settings.model,
@@ -542,7 +555,9 @@ class WeatherRepository:
 
             for idx, raw_day in enumerate(times):
                 obs_date = self._parse_date(raw_day)
-                wind_speed_max = speeds[idx] if idx < len(speeds) else None
+                wind_speed_max = speeds_max[idx] if idx < len(speeds_max) else None
+                wind_speed_mean = speeds_mean[idx] if idx < len(speeds_mean) else None
+                wind_gust_max = gusts_max[idx] if idx < len(gusts_max) else None
                 wind_direction = directions[idx] if idx < len(directions) else None
 
                 existing_day = session.execute(
@@ -555,6 +570,8 @@ class WeatherRepository:
 
                 if existing_day is not None:
                     existing_day.wind_speed_max = wind_speed_max
+                    existing_day.wind_speed_mean = wind_speed_mean
+                    existing_day.wind_gust_max = wind_gust_max
                     existing_day.wind_direction = wind_direction
                 else:
                     session.add(
@@ -563,6 +580,8 @@ class WeatherRepository:
                             source_id=source_id,
                             obs_date=obs_date,
                             wind_speed_max=wind_speed_max,
+                            wind_speed_mean=wind_speed_mean,
+                            wind_gust_max=wind_gust_max,
                             wind_direction=wind_direction,
                         )
                     )

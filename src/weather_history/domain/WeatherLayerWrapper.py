@@ -17,13 +17,17 @@ from src.weather_history.services.weather_file_exporter import export_gdf, slugi
 
 class WeatherLayerWrapper:
     DATE_CANDIDATES = ("dates", "date", "time")
-    WIND_SPEED_CANDIDATES = ("wind_speed", "windspeed", "wind_speed_10m")
-    WIND_DIR_CANDIDATES = ("wind_dir", "wind_direction", "winddir", "wind_direction_10m")
+    WIND_SPEED_MAX_CANDIDATES = ("wind_speed_max", "wind_speed", "windspeed", "wind_speed_10m_max")
+    WIND_SPEED_MEAN_CANDIDATES = ("wind_speed_mean", "wind_speed_10m_mean")
+    WIND_GUST_MAX_CANDIDATES = ("wind_gust_max", "wind_gusts_max", "wind_gusts_10m_max")
+    WIND_DIR_CANDIDATES = ("wind_dir", "wind_direction", "winddir", "wind_direction_10m_dominant")
     LAT_CANDIDATES = ("lat", "latitude")
     LON_CANDIDATES = ("lon", "longitude")
     REQ_LAT_CANDIDATES = ("req_lat",)
     REQ_LON_CANDIDATES = ("req_lon",)
-    WS_UNIT_CANDIDATES = ("ws_unit",)
+    WS_MAX_UNIT_CANDIDATES = ("ws_max_unit", "ws_unit")
+    WS_MEAN_UNIT_CANDIDATES = ("ws_mean_unit",)
+    WG_MAX_UNIT_CANDIDATES = ("wg_max_unit",)
     WD_UNIT_CANDIDATES = ("wd_unit",)
 
     def __init__(self, weather_gdf: gpd.GeoDataFrame, working_crs: str | None = None) -> None:
@@ -222,9 +226,13 @@ class WeatherLayerWrapper:
         result["source_req_lon"] = collection.req_lon[indices]
         result["weather_distance_m"] = distances.astype(float)
         result["dates"] = [collection.dates.tolist() for _ in range(len(result))]
-        result["wind_speed"] = [collection.speed[i].astype(float).tolist() for i in indices]
+        result["wind_speed_max"] = [collection.speed_max[i].astype(float).tolist() for i in indices]
+        result["wind_speed_mean"] = [collection.speed_mean[i].astype(float).tolist() for i in indices]
+        result["wind_gust_max"] = [collection.gust_max[i].astype(float).tolist() for i in indices]
         result["wind_dir"] = [collection.direction[i].astype(float).tolist() for i in indices]
-        result["ws_unit"] = collection.ws_unit
+        result["ws_max_unit"] = collection.ws_max_unit
+        result["ws_mean_unit"] = collection.ws_mean_unit
+        result["wg_max_unit"] = collection.wg_max_unit
         result["wd_unit"] = collection.wd_unit
         result["start_date"] = collection.start_date
         result["end_date"] = collection.end_date
@@ -260,13 +268,17 @@ class WeatherLayerWrapper:
         weights = 1.0 / np.maximum(distances, 1e-9) ** float(power)
         weights_sum = np.sum(weights, axis=1, keepdims=True)
         weights = weights / weights_sum
-
-        neighbor_speed = collection.speed[indices]
-        neighbor_dir = collection.direction[indices]
         w3 = weights[:, :, None]
 
-        interp_speed = np.sum(neighbor_speed * w3, axis=1)
+        def interpolate(values: np.ndarray) -> np.ndarray:
+            neighbor_values = values[indices]
+            return np.sum(neighbor_values * w3, axis=1)
 
+        interp_speed_max = interpolate(collection.speed_max)
+        interp_speed_mean = interpolate(collection.speed_mean)
+        interp_gust_max = interpolate(collection.gust_max)
+
+        neighbor_dir = collection.direction[indices]
         ang = np.deg2rad(neighbor_dir)
         sin_sum = np.sum(np.sin(ang) * w3, axis=1)
         cos_sum = np.sum(np.cos(ang) * w3, axis=1)
@@ -278,7 +290,9 @@ class WeatherLayerWrapper:
         if np.any(exact_mask):
             exact_rows = np.where(exact_mask)[0]
             exact_src = nearest_idx[exact_rows]
-            interp_speed[exact_rows, :] = collection.speed[exact_src, :]
+            interp_speed_max[exact_rows, :] = collection.speed_max[exact_src, :]
+            interp_speed_mean[exact_rows, :] = collection.speed_mean[exact_src, :]
+            interp_gust_max[exact_rows, :] = collection.gust_max[exact_src, :]
             interp_dir[exact_rows, :] = collection.direction[exact_src, :]
             nearest_dist[exact_rows] = 0.0
 
@@ -292,9 +306,13 @@ class WeatherLayerWrapper:
         result["idw_k"] = int(k_eff)
         result["idw_power"] = float(power)
         result["dates"] = [collection.dates.tolist() for _ in range(len(result))]
-        result["wind_speed"] = [row.astype(float).tolist() for row in interp_speed]
+        result["wind_speed_max"] = [row.astype(float).tolist() for row in interp_speed_max]
+        result["wind_speed_mean"] = [row.astype(float).tolist() for row in interp_speed_mean]
+        result["wind_gust_max"] = [row.astype(float).tolist() for row in interp_gust_max]
         result["wind_dir"] = [row.astype(float).tolist() for row in interp_dir]
-        result["ws_unit"] = collection.ws_unit
+        result["ws_max_unit"] = collection.ws_max_unit
+        result["ws_mean_unit"] = collection.ws_mean_unit
+        result["wg_max_unit"] = collection.wg_max_unit
         result["wd_unit"] = collection.wd_unit
         result["start_date"] = collection.start_date
         result["end_date"] = collection.end_date
@@ -302,7 +320,9 @@ class WeatherLayerWrapper:
 
     def _row_to_weather_point(self, row: pd.Series) -> WeatherPoint:
         dates = tuple(row.get("dates") or [])
-        wind_speed = tuple(row.get("wind_speed") or [])
+        wind_speed_max = tuple(row.get("wind_speed_max") or [])
+        wind_speed_mean = tuple(row.get("wind_speed_mean") or [])
+        wind_gust_max = tuple(row.get("wind_gust_max") or [])
         wind_dir = tuple(row.get("wind_dir") or [])
 
         geometry = row.geometry
@@ -320,9 +340,13 @@ class WeatherLayerWrapper:
             source_req_lat=self._safe_float(row.get("source_req_lat")),
             source_req_lon=self._safe_float(row.get("source_req_lon")),
             dates=dates,
-            wind_speed=tuple(self._safe_float(v) for v in wind_speed),
+            wind_speed_max=tuple(self._safe_float(v) for v in wind_speed_max),
+            wind_speed_mean=tuple(self._safe_float(v) for v in wind_speed_mean),
+            wind_gust_max=tuple(self._safe_float(v) for v in wind_gust_max),
             wind_dir=tuple(self._safe_float(v) for v in wind_dir),
-            ws_unit=row.get("ws_unit"),
+            ws_max_unit=row.get("ws_max_unit"),
+            ws_mean_unit=row.get("ws_mean_unit"),
+            wg_max_unit=row.get("wg_max_unit"),
             wd_unit=row.get("wd_unit"),
             start_date=row.get("start_date"),
             end_date=row.get("end_date"),
@@ -351,20 +375,26 @@ class WeatherLayerWrapper:
                 )
         dates = np.asarray(ref_dates, dtype=object)
 
-        speed = np.vstack(weather_gdf["wind_speed"].to_list()).astype(np.float32)
+        speed_max = np.vstack(weather_gdf["wind_speed_max"].to_list()).astype(np.float32)
+        speed_mean = np.vstack(weather_gdf["wind_speed_mean"].to_list()).astype(np.float32)
+        gust_max = np.vstack(weather_gdf["wind_gust_max"].to_list()).astype(np.float32)
         direction = np.vstack(weather_gdf["wind_dir"].to_list()).astype(np.float32)
 
         return WeatherCollection(
             crs=weather_gdf.crs,
             dates=dates,
-            speed=speed,
+            speed_max=speed_max,
+            speed_mean=speed_mean,
+            gust_max=gust_max,
             direction=direction,
             point_ids=weather_gdf["grid_point_id"].to_numpy(dtype=object),
             lat=weather_gdf["lat"].to_numpy(dtype=np.float64),
             lon=weather_gdf["lon"].to_numpy(dtype=np.float64),
             req_lat=weather_gdf["req_lat"].to_numpy(dtype=np.float64),
             req_lon=weather_gdf["req_lon"].to_numpy(dtype=np.float64),
-            ws_unit=weather_gdf.iloc[0].get("ws_unit"),
+            ws_max_unit=weather_gdf.iloc[0].get("ws_max_unit"),
+            ws_mean_unit=weather_gdf.iloc[0].get("ws_mean_unit"),
+            wg_max_unit=weather_gdf.iloc[0].get("wg_max_unit"),
             wd_unit=weather_gdf.iloc[0].get("wd_unit"),
             start_date=weather_gdf.iloc[0].get("start_date"),
             end_date=weather_gdf.iloc[0].get("end_date"),
@@ -378,19 +408,33 @@ class WeatherLayerWrapper:
 
         for idx, row in weather_gdf.iterrows():
             dates = self._extract_list_field(row, self.DATE_CANDIDATES)
-            wind_speed = self._extract_list_field(row, self.WIND_SPEED_CANDIDATES)
+            wind_speed_max = self._extract_list_field(row, self.WIND_SPEED_MAX_CANDIDATES)
+            wind_speed_mean = self._extract_list_field(row, self.WIND_SPEED_MEAN_CANDIDATES)
+            wind_gust_max = self._extract_list_field(row, self.WIND_GUST_MAX_CANDIDATES)
             wind_dir = self._extract_list_field(row, self.WIND_DIR_CANDIDATES)
 
             if not dates:
                 raise ValueError(f"Weather row {idx} does not contain dates")
-            if not wind_speed:
-                raise ValueError(f"Weather row {idx} does not contain wind_speed")
+            if not wind_speed_max:
+                raise ValueError(f"Weather row {idx} does not contain wind_speed_max")
+            if not wind_speed_mean:
+                raise ValueError(f"Weather row {idx} does not contain wind_speed_mean")
+            if not wind_gust_max:
+                raise ValueError(f"Weather row {idx} does not contain wind_gust_max")
             if not wind_dir:
                 raise ValueError(f"Weather row {idx} does not contain wind_dir")
-            if not (len(dates) == len(wind_speed) == len(wind_dir)):
+            if not (
+                len(dates)
+                == len(wind_speed_max)
+                == len(wind_speed_mean)
+                == len(wind_gust_max)
+                == len(wind_dir)
+            ):
                 raise ValueError(
                     f"Weather row {idx} has inconsistent array lengths: "
-                    f"dates={len(dates)}, wind_speed={len(wind_speed)}, wind_dir={len(wind_dir)}"
+                    f"dates={len(dates)}, wind_speed_max={len(wind_speed_max)}, "
+                    f"wind_speed_mean={len(wind_speed_mean)}, "
+                    f"wind_gust_max={len(wind_gust_max)}, wind_dir={len(wind_dir)}"
                 )
 
             normalized = row.drop(labels="geometry").to_dict()
@@ -401,9 +445,13 @@ class WeatherLayerWrapper:
             normalized["req_lat"] = self._extract_scalar_field(row, self.REQ_LAT_CANDIDATES)
             normalized["req_lon"] = self._extract_scalar_field(row, self.REQ_LON_CANDIDATES)
             normalized["dates"] = [self._to_date_string(v) for v in dates]
-            normalized["wind_speed"] = [self._safe_float(v) for v in wind_speed]
+            normalized["wind_speed_max"] = [self._safe_float(v) for v in wind_speed_max]
+            normalized["wind_speed_mean"] = [self._safe_float(v) for v in wind_speed_mean]
+            normalized["wind_gust_max"] = [self._safe_float(v) for v in wind_gust_max]
             normalized["wind_dir"] = [self._normalize_angle(v) for v in wind_dir]
-            normalized["ws_unit"] = self._extract_scalar_field(row, self.WS_UNIT_CANDIDATES)
+            normalized["ws_max_unit"] = self._extract_scalar_field(row, self.WS_MAX_UNIT_CANDIDATES)
+            normalized["ws_mean_unit"] = self._extract_scalar_field(row, self.WS_MEAN_UNIT_CANDIDATES)
+            normalized["wg_max_unit"] = self._extract_scalar_field(row, self.WG_MAX_UNIT_CANDIDATES)
             normalized["wd_unit"] = self._extract_scalar_field(row, self.WD_UNIT_CANDIDATES)
             normalized["start_date"] = row.get("start_date")
             normalized["end_date"] = row.get("end_date")
@@ -435,9 +483,13 @@ class WeatherLayerWrapper:
                     "start_date": row_dict.get("start_date"),
                     "end_date": row_dict.get("end_date"),
                     "dates": row_dict.get("dates"),
-                    "wind_speed": row_dict.get("wind_speed"),
+                    "wind_speed_max": row_dict.get("wind_speed_max"),
+                    "wind_speed_mean": row_dict.get("wind_speed_mean"),
+                    "wind_gust_max": row_dict.get("wind_gust_max"),
                     "wind_dir": row_dict.get("wind_dir"),
-                    "ws_unit": row_dict.get("ws_unit"),
+                    "ws_max_unit": row_dict.get("ws_max_unit"),
+                    "ws_mean_unit": row_dict.get("ws_mean_unit"),
+                    "wg_max_unit": row_dict.get("wg_max_unit"),
                     "wd_unit": row_dict.get("wd_unit"),
                     "weather_records_count": row_dict.get("weather_records_count"),
                     "geometry": row_dict.get("geometry"),

@@ -11,14 +11,18 @@ from scipy.spatial import cKDTree
 class WeatherCollection:
     crs: Any
     dates: np.ndarray
-    speed: np.ndarray
+    speed_max: np.ndarray
+    speed_mean: np.ndarray
+    gust_max: np.ndarray
     direction: np.ndarray
     point_ids: np.ndarray
     lat: np.ndarray
     lon: np.ndarray
     req_lat: np.ndarray
     req_lon: np.ndarray
-    ws_unit: str | None
+    ws_max_unit: str | None
+    ws_mean_unit: str | None
+    wg_max_unit: str | None
     wd_unit: str | None
     start_date: str | None
     end_date: str | None

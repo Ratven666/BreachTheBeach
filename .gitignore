@@ -241,4 +241,20 @@ test.py
 
 nvrsk_calc/
 /vyborg/
+<<<<<<< Updated upstream
 /compare_bathymetry_sources.py
+=======
+/for_thesis/
+>>>>>>> Stashed changes
+/whether_db/
+/Sakhalin_and_islands_whether_db/
+/MurmaskAndWthiteSeaArea/
+/KareliaAndArckhangelsArea/
+/PrimorskyKray/
+/KhabarovskyKray/
+/MagadanArea/
+/KamchatkaArea/
+/BlackSeaArea/
+/Baltic_sea_whether_db/
+
+*.geojson

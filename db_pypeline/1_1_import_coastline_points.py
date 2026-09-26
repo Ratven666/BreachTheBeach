@@ -1,64 +1,130 @@
-# db_pypeline/1_1_import_coastline_points.py
-"""
-Импорт точек береговой линии из GeoJSON в БД
-с фиксированным шагом по пикетажу.
-"""
-
 from __future__ import annotations
 
+from coastline.storage.models import Base, CoastlineSourceModel, CoastlinePointModel
+
+"""
+db_pypeline/1_1_import_coastline_points.py
+
+Запуск (из корня проекта):
+    python db_pypeline/1_1_import_coastline_points.py
+"""
+
+import json
 import os
+import sys
 from pathlib import Path
 
-# Задаём путь к БД ДО первого импорта src.coastline.storage.db,
-# чтобы DATABASE_URL вычислился с нужным значением.
-_DB_PATH = Path(__file__).parent / "data" / "db" / "coastline.db"
-_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("COASTLINE_DATABASE_URL", f"sqlite:///{_DB_PATH.as_posix()}")
+from loguru import logger
 
-from src.coastline.domain.CoastlineDataset import CoastlineDataset
-from src.coastline.exporters.SQLitePointExporter import SQLitePointExporter
-from src.coastline.point_strategies.EqualStepAlongLineStrategy import (
-    EqualStepAlongLineStrategy,
-)
-from src.coastline.point_strategies.PointExtractionStrategy import PointSource
-from src.coastline.services import CoastlinePointExtractor
+sys.path.insert(0, str(Path(__file__).parent))
 
-# ---------------------------------------------------------------------------
-GEOJSON_PATH: Path = Path("data/coastline/nvrsk_main_coastline.geojson")
+# ── Конфигурация ──────────────────────────────────────────────────────
+DATABASE_PATH = Path("data/db/coastline.db")
 
-STEP_M: float = 200.0
-INCLUDE_ENDPOINTS: bool = True
-SOURCE: PointSource = PointSource.ALL_LINES
-INPUT_CRS: str | None = None
-WORKING_CRS: str | None = None
-DATASET_NAME: str | None = None
+COASTLINE_MAIN_PATH  = Path("data/coastline/nvrsk_main_coastline.geojson")
+COASTLINE_OTHER_PATH: Path | None = None
 
-POINT_STRATEGY = EqualStepAlongLineStrategy(
-    step_m=STEP_M,
-    source=SOURCE,
-    include_endpoints=INCLUDE_ENDPOINTS,
-    input_crs=INPUT_CRS,
-    working_crs=WORKING_CRS,
-)
-# ---------------------------------------------------------------------------
+DATASET_NAME    = "nvrsk_main_coastline"
+STRATEGY_STEP_M = 200.0
+INPUT_CRS       = "EPSG:4326"
+# ─────────────────────────────────────────────────────────────────────
+
+
+def setup_env() -> None:
+    if "COASTLINE_DATABASE_URL" not in os.environ:
+        url = f"sqlite:///{DATABASE_PATH.resolve().as_posix()}"
+        os.environ["COASTLINE_DATABASE_URL"] = url
+        logger.debug(f"COASTLINE_DATABASE_URL → {url}")
 
 
 def main() -> None:
+    setup_env()
+
+    from sqlalchemy import insert
+
+    from src.coastline.domain.CoastlineDataset import CoastlineDataset
+    from src.coastline.point_strategies import EqualStepAlongLineStrategy
+    from src.coastline.point_strategies.PointExtractionStrategy import PointSource
+    from src.coastline.services import CoastlinePointExtractor
+    from src.coastline.storage import db as _db
+
+    # 1. Инициализация схемы
+    Base.metadata.create_all(_db.engine)
+    logger.info("DB schema ready")
+
+    # 2. Датасет береговой линии
     dataset = CoastlineDataset.from_geojson(
-        main_path=GEOJSON_PATH,
-        name=DATASET_NAME or GEOJSON_PATH.stem,
+        main_path=str(COASTLINE_MAIN_PATH),
+        other_path=str(COASTLINE_OTHER_PATH) if COASTLINE_OTHER_PATH else None,
+        name=DATASET_NAME,
+    )
+    logger.info(
+        f"Dataset: main={len(dataset.main_gdf)} feat, "
+        f"other={len(dataset.other_gdf)} feat, crs={dataset.crs}"
+    )
+
+    # 3. Стратегия и извлечение точек
+    strategy = EqualStepAlongLineStrategy(
+        step_m=STRATEGY_STEP_M,
+        source=PointSource.MAIN_ONLY,
+        include_endpoints=True,
+        working_crs=None,
+        input_crs=INPUT_CRS,
+    )
+    strategy_params = json.dumps(
+        {
+            "step_m":            STRATEGY_STEP_M,
+            "source":            PointSource.MAIN_ONLY.value,
+            "include_endpoints": True,
+            "working_crs":       None,
+            "input_crs":         INPUT_CRS,
+        },
+        ensure_ascii=False,
     )
 
     extractor = CoastlinePointExtractor()
-    point_set = extractor.extract(
-        dataset=dataset,
-        strategy=POINT_STRATEGY,
-        name=DATASET_NAME or GEOJSON_PATH.stem,
-    )
+    point_set = extractor.extract(dataset=dataset, strategy=strategy, name=DATASET_NAME)
     point_set.print_summary()
 
-    db_path = point_set.export(SQLitePointExporter(), output_path="")
-    print(f"Сохранено → {db_path}")
+    # 4. Запись в БД
+    with _db.SessionLocal() as session:
+
+        source = CoastlineSourceModel(
+            name=point_set.meta.name,
+            strategy_name=point_set.meta.strategy_name,
+            source_mode=point_set.meta.source_mode,
+            strategy_params=strategy_params,
+            main_geojson_path=str(COASTLINE_MAIN_PATH.resolve()),
+            other_geojson_path=(
+                str(COASTLINE_OTHER_PATH.resolve())
+                if COASTLINE_OTHER_PATH else None
+            ),
+            crs=str(point_set.gdf.crs) if point_set.gdf.crs else None,
+            points_count=len(point_set.gdf),
+        )
+        session.add(source)
+        session.flush()
+
+        rows_data = [
+            {
+                "source_id": source.id,
+                "seq":       int(seq),
+                "lon":       float(row.geometry.x),
+                "lat":       float(row.geometry.y),
+            }
+            for seq, row in point_set.gdf.iterrows()
+        ]
+        session.execute(insert(CoastlinePointModel), rows_data)
+
+        saved_id   = source.id
+        saved_name = source.name
+
+        session.commit()
+
+    logger.success(
+        f"Saved {len(rows_data)} points → "
+        f"source id={saved_id} name={saved_name!r}"
+    )
 
 
 if __name__ == "__main__":

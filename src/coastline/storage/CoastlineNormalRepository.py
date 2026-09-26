@@ -129,11 +129,15 @@ class CoastlineNormalRepository:
 
     def load_as_gdf(self, normal_source_id: int) -> gpd.GeoDataFrame:
         """
-        Читает нормали по id и возвращает GeoDataFrame.
+        Читает нормали по id и возвращает GeoDataFrame в EPSG:4326.
 
         Колонки: normal_id, normal_source_id, point_id,
-                 nx, ny, normal_azimuth_deg, geometry (Point, result_crs).
-        Координаты берутся через JOIN с coastline_points.
+                 nx, ny, normal_azimuth_deg, geometry (Point, EPSG:4326).
+
+        Координаты точек (p.lon / p.lat) хранятся в coastline_points
+        в WGS-84 градусах, поэтому CRS результата всегда EPSG:4326,
+        независимо от result_crs набора нормалей (та хранит метрическую
+        CRS вычислений и не связана с форматом хранения координат).
         """
         ns = self._session.get(CoastlineNormalSourceModel, normal_source_id)
         if ns is None:
@@ -158,16 +162,17 @@ class CoastlineNormalRepository:
             {
                 "normal_id":          n.id,
                 "normal_source_id":   n.normal_source_id,
-                "point_id":           n.point_id,
+                "point_id":           n.point_id,   # DB-id → FK в wind_fetches
                 "nx":                 n.nx,
                 "ny":                 n.ny,
                 "normal_azimuth_deg": n.normal_azimuth_deg,
+                # p.lon / p.lat — градусы WGS-84; CRS явно EPSG:4326
                 "geometry":           Point(p.lon, p.lat),
             }
             for n, p in rows
         ]
 
-        return gpd.GeoDataFrame(records, geometry="geometry", crs=ns.result_crs)
+        return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
 
     # ------------------------------------------------------------------
     # Private

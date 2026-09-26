@@ -1,4 +1,3 @@
-# src/wind_fetch/models.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,16 +6,21 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class WindFetchPaths:
     main_coastline_path: str
-    other_coastline_path: str
+    other_coastline_path: str | None
     points_with_normals_path: str
 
 
 @dataclass(slots=True)
 class WindFetchResult:
     """
-    Результат трассировки одного луча для одной точки и одного азимута.
-    ray_azimuth_deg  — азимут самого луча (тот, по которому шла трассировка).
-    normal_azimuth_deg — нормаль берега в исходной точке (опорный азимут).
+    Результат трассировки одного луча
+    для одной точки и одного азимута.
+
+    ray_azimuth_deg:
+        азимут луча, по которому выполнялась трассировка.
+
+    normal_azimuth_deg:
+        азимут нормали береговой линии в исходной точке.
     """
 
     point_id: int
@@ -27,8 +31,8 @@ class WindFetchResult:
     start_point_lon: float
     start_point_lat: float
 
-    ray_azimuth_deg: float        # был azimuth_deg — переименован
-    normal_azimuth_deg: float     # новое поле
+    ray_azimuth_deg: float
+    normal_azimuth_deg: float
 
     fetch_length_m: float
 
@@ -42,17 +46,19 @@ class WindFetchResult:
 @dataclass(slots=True)
 class MultiDirectionFetchResult:
     """
-    Один результат = одна исходная точка + один абсолютный азимут.
+    Результат расчёта для одной исходной точки
+    и одного абсолютного азимута.
 
-    Если азимут попадает в сухопутный сектор относительно нормали,
-    честная трассировка не выполняется, а fetch_length_m = offset_m.
+    Если азимут попадает в сухопутный сектор относительно
+    нормали, трассировка не выполняется, а fetch_length_m
+    принимается равным offset_m.
     """
 
     point_id: int
     direction_id: int
 
     normal_azimuth_deg: float
-    azimuth_deg: float            # ray azimuth (абсолютный)
+    azimuth_deg: float
 
     source_point_lon: float
     source_point_lat: float

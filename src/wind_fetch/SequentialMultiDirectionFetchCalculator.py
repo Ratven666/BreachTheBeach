@@ -192,7 +192,6 @@ class SequentialMultiDirectionFetchCalculator:
                 continue
             if not isinstance(geom, Point):
                 continue
-            # point_id берётся из GDF — нумерация совпадает с CoastlineNormalPointSet (0-based)
             if "point_id" in row.index and row["point_id"] is not None:
                 point_id = int(row["point_id"])
             else:
@@ -739,14 +738,7 @@ class SequentialMultiDirectionFetchCalculator:
         results: Sequence[MultiDirectionFetchResult],
         output_dir: str | Path | None = None,
     ) -> dict[str, str]:
-        """Сохраняет только файлы, необходимые для downstream пайплайна.
-
-        Записывает:
-        • fetch_by_point.csv     — агрегированная таблица (point × [azimuths, fetches])
-        • fetch_by_point.geojson — то же в геоформате для QGIS
-
-        Для полного набора отладочных слоёв используйте save_combined().
-        """
+        """Сохраняет только файлы, необходимые для downstream пайплайна."""
         out_dir = Path(output_dir or self.config.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 

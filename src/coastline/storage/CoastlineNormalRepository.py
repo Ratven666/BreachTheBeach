@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import geopandas as gpd
 from loguru import logger
+from shapely.geometry import Point
 from sqlalchemy import insert, select
 from sqlalchemy.orm import Session
 
 from src.coastline.domain.CoastlineNormalPointSet import CoastlineNormalPointSet
 from src.coastline.services.CoastlineNormalService import CoastlineNormalConfig
 from src.coastline.storage.models import (
-    COORD_SCALE,
     CoastlineNormalModel,
     CoastlineNormalSourceModel,
+    CoastlinePointModel,
     CoastlineSourceModel,
 )
 
 
 class CoastlineNormalRepository:
     """
-    Сохраняет и читает CoastlineNormalPointSet из SQLite через SQLAlchemy.
+    Сохраняет и читает нормали береговой линии через SQLAlchemy.
+
+    В БД хранятся только поля CoastlineNormalModel:
+        normal_source_id, point_id, nx, ny, normal_azimuth_deg.
+    Координаты точек (lon/lat) берутся через JOIN с coastline_points.
+    Поля chainage_m, tx, ty, sea_side в БД не хранятся.
 
     Пример
     ------
@@ -28,6 +35,7 @@ class CoastlineNormalRepository:
             config=config,
             name="nvrsk_normals_step200m_right",
         )
+        gdf = repo.load_as_gdf(normal_source_id)
     """
 
     def __init__(self, session: Session) -> None:
@@ -48,12 +56,15 @@ class CoastlineNormalRepository:
         """
         Сохраняет CoastlineNormalPointSet в БД.
         Возвращает id созданной записи CoastlineNormalSourceModel.
+
+        Ожидает, что в normal_set.gdf есть колонка point_id —
+        FK на coastline_points.id (заполняется CoastlineNormalService).
         """
         self._assert_point_source_exists(point_source_id)
 
         crs_str = str(normal_set.gdf.crs) if normal_set.gdf.crs is not None else None
 
-        # 1. Метаданные запуска нормалей
+        # 1. Метаданные набора нормалей
         normal_source = CoastlineNormalSourceModel(
             name=name,
             point_source_id=point_source_id,
@@ -66,19 +77,16 @@ class CoastlineNormalRepository:
         self._session.add(normal_source)
         self._session.flush()  # получаем normal_source.id
 
-        # 2. Точки нормалей — core INSERT (обход bulk_save_objects / BigInteger PK)
+        # 2. Строки нормалей — только поля CoastlineNormalModel
         rows_data = [
             {
-                "normal_source_id": normal_source.id,
-                "seq": int(seq),
-                "lon_i": round(float(row.geometry.x) * COORD_SCALE),
-                "lat_i": round(float(row.geometry.y) * COORD_SCALE),
-                "chainage_m": float(row["chainage_m"]),
-                "nx": float(row["nx"]),
-                "ny": float(row["ny"]),
+                "normal_source_id":   normal_source.id,
+                "point_id":           int(row["point_id"]),
+                "nx":                 float(row["nx"]),
+                "ny":                 float(row["ny"]),
                 "normal_azimuth_deg": float(row["normal_azimuth_deg"]),
             }
-            for seq, row in normal_set.gdf.iterrows()
+            for _, row in normal_set.gdf.iterrows()
         ]
         self._session.execute(insert(CoastlineNormalModel), rows_data)
         self._session.commit()
@@ -106,24 +114,27 @@ class CoastlineNormalRepository:
         )
         return [
             {
-                "id":               r.id,
-                "name":             r.name,
-                "point_source_id":  r.point_source_id,
-                "sea_side":         r.sea_side,
-                "tangent_delta_m":  r.tangent_delta_m,
-                "working_crs":      r.working_crs,
-                "result_crs":       r.result_crs,
-                "normals_count":    r.normals_count,
-                "created_at":       str(r.created_at),
+                "id":              r.id,
+                "name":            r.name,
+                "point_source_id": r.point_source_id,
+                "sea_side":        r.sea_side,
+                "tangent_delta_m": r.tangent_delta_m,
+                "working_crs":     r.working_crs,
+                "result_crs":      r.result_crs,
+                "normals_count":   r.normals_count,
+                "created_at":      str(r.created_at),
             }
             for r in rows
         ]
 
-    def load(self, normal_source_id: int) -> CoastlineNormalPointSet:
-        """Читает нормали по id CoastlineNormalSourceModel."""
-        import geopandas as gpd
-        from shapely.geometry import Point
+    def load_as_gdf(self, normal_source_id: int) -> gpd.GeoDataFrame:
+        """
+        Читает нормали по id и возвращает GeoDataFrame.
 
+        Колонки: normal_id, normal_source_id, point_id,
+                 nx, ny, normal_azimuth_deg, geometry (Point, result_crs).
+        Координаты берутся через JOIN с coastline_points.
+        """
         ns = self._session.get(CoastlineNormalSourceModel, normal_source_id)
         if ns is None:
             raise ValueError(
@@ -132,34 +143,31 @@ class CoastlineNormalRepository:
 
         rows = (
             self._session.execute(
-                select(CoastlineNormalModel)
+                select(CoastlineNormalModel, CoastlinePointModel)
+                .join(
+                    CoastlinePointModel,
+                    CoastlineNormalModel.point_id == CoastlinePointModel.id,
+                )
                 .where(CoastlineNormalModel.normal_source_id == normal_source_id)
-                .order_by(CoastlineNormalModel.seq)
+                .order_by(CoastlineNormalModel.id)
             )
-            .scalars()
             .all()
         )
 
         records = [
             {
-                "point_id":           r.point_id,
-                "chainage_m":         r.chainage_m,
-                "tx":                 r.tx,
-                "ty":                 r.ty,
-                "nx":                 r.nx,
-                "ny":                 r.ny,
-                "normal_azimuth_deg": r.normal_azimuth_deg,
-                "sea_side":           r.sea_side,
-                "geometry":           Point(
-                    r.lon_i / COORD_SCALE,
-                    r.lat_i / COORD_SCALE,
-                ),
+                "normal_id":          n.id,
+                "normal_source_id":   n.normal_source_id,
+                "point_id":           n.point_id,
+                "nx":                 n.nx,
+                "ny":                 n.ny,
+                "normal_azimuth_deg": n.normal_azimuth_deg,
+                "geometry":           Point(p.lon, p.lat),
             }
-            for r in rows
+            for n, p in rows
         ]
 
-        gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=ns.result_crs)
-        return CoastlineNormalPointSet.from_gdf(gdf, name=ns.name)
+        return gpd.GeoDataFrame(records, geometry="geometry", crs=ns.result_crs)
 
     # ------------------------------------------------------------------
     # Private

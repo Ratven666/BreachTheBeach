@@ -57,6 +57,10 @@ class CoastlineNormalPointSet:
     - nx, ny : float
     - normal_azimuth_deg : float
     - sea_side : str
+
+    Внутренние вычисления выполняются в метрической CRS.
+    При экспорте в GeoJSON данные автоматически перепроецируются в WGS84 (EPSG:4326),
+    что обеспечивает корректное отображение координат как lon/lat.
     """
 
     REQUIRED_COLUMNS = {
@@ -80,6 +84,8 @@ class CoastlineNormalPointSet:
         "ny",
         "normal_azimuth_deg",
     }
+
+    _GEOJSON_CRS = "EPSG:4326"
 
     def __init__(
         self,
@@ -226,6 +232,12 @@ class CoastlineNormalPointSet:
         self,
         normal_length_m: float,
     ) -> gpd.GeoDataFrame:
+        """
+        Строит GeoDataFrame линий нормалей в метрической CRS объекта.
+        Вычисления выполняются в метрах: end = point + (nx, ny) * length_m.
+        Для экспорта в GeoJSON используйте export_normal_lines_geojson(),
+        которая автоматически перепроецирует результат в WGS84.
+        """
         if normal_length_m <= 0:
             raise ValueError("normal_length_m must be > 0")
 
@@ -253,16 +265,25 @@ class CoastlineNormalPointSet:
         return gpd.GeoDataFrame(records, geometry="geometry", crs=self.gdf.crs)
 
     def to_geojson(self, path: str | Path) -> None:
+        """
+        Сохраняет точки с нормалями в GeoJSON.
+        Перед записью перепроецирует данные в WGS84 (EPSG:4326),
+        чтобы координаты в файле были корректными lon/lat градусами.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.gdf.to_file(path, driver="GeoJSON")
-        self._log.info(f"Saved normal points to {path}")
+        self.gdf.to_crs(self._GEOJSON_CRS).to_file(path, driver="GeoJSON")
+        self._log.info(f"Saved normal points to {path} (reprojected to {self._GEOJSON_CRS})")
 
     def to_gpkg(
         self,
         path: str | Path,
         layer: str = "normal_points",
     ) -> None:
+        """
+        Сохраняет точки с нормалями в GeoPackage в метрической CRS.
+        GPKG поддерживает любую CRS, поэтому репроецирование не требуется.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.gdf.to_file(path, layer=layer, driver="GPKG")
@@ -273,11 +294,19 @@ class CoastlineNormalPointSet:
         path: str | Path,
         normal_length_m: float,
     ) -> None:
+        """
+        Строит линии нормалей и сохраняет их в GeoJSON.
+        Линии вычисляются в метрической CRS, затем перепроецируются
+        в WGS84 (EPSG:4326) перед записью, чтобы координаты в файле
+        были корректными lon/lat градусами.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         lines_gdf = self.to_normal_lines_gdf(normal_length_m=normal_length_m)
-        lines_gdf.to_file(path, driver="GeoJSON")
-        self._log.info(f"Saved normal lines to {path}")
+        lines_gdf.to_crs(self._GEOJSON_CRS).to_file(path, driver="GeoJSON")
+        self._log.info(
+            f"Saved normal lines to {path} (reprojected to {self._GEOJSON_CRS})"
+        )
 
     def summary(self) -> CoastlineNormalsSummary:
         az = self.gdf["normal_azimuth_deg"].dropna()
@@ -387,16 +416,11 @@ class CoastlineNormalPointSet:
         except Exception:
             return f"CoastlineNormalPointSet(name={self.name})"
 
+
 if __name__ == "__main__":
     from pathlib import Path
 
     import geopandas as gpd
-
-    # импортируй свой класс так, как он лежит в проекте
-    # например:
-    # from src.coastline.domain.CoastlineNormalPointSet import CoastlineNormalPointSet
-
-
 
     def demo_normal_point_set() -> None:
         input_path = Path("../../../output/points_with_normals.geojson")
@@ -456,7 +480,7 @@ if __name__ == "__main__":
         print(subset.head_text(n=10))
         print()
 
-        # 7. Построение линий нормалей
+        # 7. Построение линий нормалей (в метрической CRS — для внутреннего использования)
         normal_lines_gdf = normal_points_sorted.to_normal_lines_gdf(
             normal_length_m=300.0
         )
@@ -466,6 +490,7 @@ if __name__ == "__main__":
         print()
 
         # 8. Экспорт результатов
+        # to_geojson и export_normal_lines_geojson автоматически перепроецируют в WGS84
         normal_points_sorted.to_geojson(output_dir / "normal_points_sorted.geojson")
         normal_points_sorted.to_gpkg(
             output_dir / "normal_points_sorted.gpkg",
@@ -476,12 +501,9 @@ if __name__ == "__main__":
             normal_length_m=300.0,
         )
 
-        # если хочешь отдельно сохранить subset
         subset.to_geojson(output_dir / "normal_points_subset_0_2000m.geojson")
 
         print("=== DONE ===")
         print(f"Saved outputs to: {output_dir.resolve()}")
 
-
-    if __name__ == "__main__":
-        demo_normal_point_set()
+    demo_normal_point_set()

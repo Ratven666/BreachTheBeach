@@ -323,7 +323,7 @@ if __name__ == "__main__":
         CoastlineNormalConfig(
             sea_side="right",
             normal_length_m=300.0,
-            tangent_delta_m=10.0,
+            tangent_delta_m=1.0,
             working_crs=str(dataset.metric_crs),
         )
     )

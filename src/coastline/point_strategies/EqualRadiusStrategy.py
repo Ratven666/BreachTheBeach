@@ -240,3 +240,15 @@ class EqualRadiusStrategy(PointExtractionStrategy):
             return [g for g in geom.geoms if isinstance(g, Point)]
 
         return []
+
+    @property
+    def params(self) -> dict:
+        return {
+            **super().params,
+            "radius_step_m": self.radius_step_m,
+            "include_origin": self.include_origin,
+            "include_endpoint": self.include_endpoint,
+            "working_crs": self.working_crs,
+            "input_crs": self.input_crs,
+            "search_tolerance_m": self.search_tolerance_m,
+        }

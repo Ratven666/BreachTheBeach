@@ -1,3 +1,4 @@
+# src/coastline/services/CoastlinePointExtractor.py
 from __future__ import annotations
 
 import geopandas as gpd
@@ -5,7 +6,7 @@ import pandas as pd
 from loguru import logger
 
 from src.coastline.domain.CoastlineDataset import CoastlineDataset
-from src.coastline.domain.CoastlinePointSet import CoastlinePointSet, PointSetMeta
+from src.coastline.domain.CoastlinePointSet import CoastlinePointSet
 from src.coastline.point_strategies.PointExtractionStrategy import PointExtractionStrategy
 
 
@@ -21,7 +22,8 @@ class CoastlinePointExtractor:
         strategy: PointExtractionStrategy,
         name: str | None = None,
     ) -> CoastlinePointSet:
-        point_set_name = name or f"{dataset.name}__{strategy.name}"
+        point_set_name = name or dataset.name
+
         log = logger.bind(cls="CoastlinePointExtractor", name=point_set_name)
         log.info(f"Extracting points via {strategy.name}")
 
@@ -30,13 +32,11 @@ class CoastlinePointExtractor:
 
         gdf = self._to_geodataframe(records, crs=dataset.crs)
 
-        meta = PointSetMeta(
-            name=point_set_name,
-            source_dataset_name=dataset.name,
-            strategy_name=strategy.name,
-            source_mode=getattr(strategy, "source", "combined").value
-            if hasattr(getattr(strategy, "source", None), "value")
-            else "combined",
+        # build_meta() берёт strategy.params и собирает PointSetMeta с
+        # полным набором параметров стратегии (step_m, radius_step_m и т.д.)
+        meta = strategy.build_meta(
+            dataset_name=dataset.name,
+            point_set_name=point_set_name,
             points_count=len(gdf),
         )
 
@@ -44,14 +44,9 @@ class CoastlinePointExtractor:
         return CoastlinePointSet(gdf=gdf, meta=meta)
 
     # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
 
     @staticmethod
-    def _to_geodataframe(
-        records: list[dict],
-        crs,
-    ) -> gpd.GeoDataFrame:
+    def _to_geodataframe(records: list[dict], crs) -> gpd.GeoDataFrame:
         if not records:
             return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs=crs)
 

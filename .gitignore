@@ -256,5 +256,6 @@ nvrsk_calc/
 /KamchatkaArea/
 /BlackSeaArea/
 /Baltic_sea_whether_db/
+/sourse_db/
 
 *.geojson

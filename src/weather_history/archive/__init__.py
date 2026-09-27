@@ -7,6 +7,7 @@ from .builder import (
 from .repository import (
     CompactWeatherRepository,
     GridPoint,
+    InterpolatedWeatherRecord,
     WeatherRecord,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "discover_databases",
     "CompactWeatherRepository",
     "GridPoint",
+    "InterpolatedWeatherRecord",
     "WeatherRecord",
 ]

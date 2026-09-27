@@ -3,6 +3,7 @@ from .wave_activity_repository import (
     WaveActivityRepository,
     WaveActivityRow,
     WaveActivitySummaryRow,
+    WaveExposureIndexRow,
     WavePointRow,
 )
 
@@ -12,5 +13,6 @@ __all__ = [
     "WaveActivityRepository",
     "WaveActivityRow",
     "WaveActivitySummaryRow",
+    "WaveExposureIndexRow",
     "WavePointRow",
 ]

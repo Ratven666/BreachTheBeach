@@ -19,7 +19,8 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent))
 
 # ── Конфигурация ──────────────────────────────────────────────────────
-DATABASE_PATH = Path("data/db/coastline.db")
+_SCRIPT_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = _SCRIPT_DIR / "data" / "db" / "coastline.db"
 
 COASTLINE_MAIN_PATH  = Path("data/coastline/nvrsk_main_coastline.geojson")
 COASTLINE_OTHER_PATH: Path | None = None

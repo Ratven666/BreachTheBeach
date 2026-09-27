@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from coastline.storage.models import Base, CoastlineSourceModel, CoastlinePointModel
+from src.coastline.storage.models import Base, CoastlineSourceModel, CoastlinePointModel
 
 """
 db_pypeline/1_1_import_coastline_points.py

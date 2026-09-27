@@ -273,7 +273,7 @@ def main() -> None:
             {
                 "point_id":       r.point_id,
                 "azimuth_deg":    r.azimuth_deg,
-                "fetch_length_m": r.fetch_length_m,
+                "fetch_length_m": round(r.fetch_length_m),
             }
         )
 

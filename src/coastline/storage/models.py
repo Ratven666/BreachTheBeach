@@ -243,6 +243,8 @@ class WindFetchModel(Base):
     """
     Рассчитанная длина разгона ветра для одной точки
     и одного абсолютного азимута.
+    fetch_length_m хранится как целое число метров
+    (округление по правилу «банкирского округления» — round()).
 
     Одна строка соответствует уникальной паре:
         point_id + azimuth_deg
@@ -276,8 +278,8 @@ class WindFetchModel(Base):
         Float,
         nullable=False,
     )
-    fetch_length_m: Mapped[float] = mapped_column(
-        Float,
+    fetch_length_m: Mapped[int] = mapped_column(
+        Integer,
         nullable=False,
     )
 

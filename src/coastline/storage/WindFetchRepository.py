@@ -92,7 +92,7 @@ class WindFetchRepository:
                 {
                     "point_id": point_id,
                     "azimuth_deg": azimuth_deg,
-                    "fetch_length_m": float(
+                    "fetch_length_m": round(
                         result.fetch_length_m
                     ),
                 }

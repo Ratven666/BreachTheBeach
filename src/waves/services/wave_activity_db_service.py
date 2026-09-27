@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-"""Быстрый расчёт дневной волновой активности с мультипроцессингом."""
+"""Быстрый расчёт дневной волновой активности с мультипроцессингом.
+
+Правила хранения:
+  * wave_points.normal_azimuth_deg — целый градус [0, 359];
+  * wave_activity.cwef_wm — целое округлённое значение, Вт/м;
+    дни с округлённым CWEF = 0 не сохраняются;
+  * wave_activity_summary — n_days по всем валидным дням,
+    статистики (mean, median, std, перцентили, max, штормовые дни)
+    только по дням с CWEF > 0 (см. WaveActivitySummaryRow.from_powers).
+"""
 
 import math
 import multiprocessing
@@ -77,6 +86,7 @@ class WaveActivityBuildStats:
 class _PointResult:
     point: CoastlineWavePoint
     activity_rows: list[tuple[int, int, int, int]]
+    # Точные CWEF за все валидные дни, включая нулевые.
     cwef_all: list[float]
     skipped_weather: int
     land_sector_days: int
@@ -265,11 +275,11 @@ def _process_point(payload: _WorkerPayload) -> _PointResult:
                     if not math.isfinite(cwef_wm) or cwef_wm < 0.0:
                         cwef_wm = 0.0
 
-            # Статистика считается по точным значениям.
+            # Полный ряд (с нулями) нужен для n_days; статистики по CWEF > 0
+            # отбираются внутри WaveActivitySummaryRow.from_powers.
             cwef_all.append(float(cwef_wm))
 
-            # В wave_activity сохраняется целое округлённое значение;
-            # дни, округлившиеся до 0, не сохраняются (разреженная таблица).
+            # В wave_activity — целое округлённое значение; нули не сохраняются.
             cwef_int = round_cwef_wm(cwef_wm)
             if cwef_int >= 1:
                 activity_rows.append((
@@ -539,12 +549,15 @@ class WaveActivityDatabaseBuilder:
                 )
                 for r in result.activity_rows
             ]
+            stored_rows = 0
             for start in range(0, len(batch), self._commit_batch_size):
-                total_activity += self._output.add_activity(
+                stored_rows += self._output.add_activity(
                     batch[start: start + self._commit_batch_size]
                 )
                 self._output.commit()
+            total_activity += stored_rows
 
+            # Статистики — только по дням с CWEF > 0; n_days — по всем дням.
             summary = WaveActivitySummaryRow.from_powers(
                 point.point_id, result.cwef_all,
             )
@@ -556,13 +569,19 @@ class WaveActivityDatabaseBuilder:
             land_sector_rows += result.land_sector_days
             missing_bathymetry += result.missing_bathymetry_days
 
+            # Дни с 0 < CWEF < 0.5 входят в статистику, но не в wave_activity.
+            below_rounding = summary.n_active_days - stored_rows
+
             logger.info(
                 "[{}/{}] point_id={}: days={}, active_days={}, stored_rows={}, "
-                "land={}, no_bathy={}, skip_wx={}",
+                "below_1wm={}, mean={}, median={}, land={}, no_bathy={}, skip_wx={}",
                 idx, total, point.point_id,
                 summary.n_days,
                 summary.n_active_days,
-                len(batch),
+                stored_rows,
+                below_rounding,
+                summary.mean_cwef_wm,
+                summary.median_cwef_wm,
                 result.land_sector_days,
                 result.missing_bathymetry_days,
                 result.skipped_weather,

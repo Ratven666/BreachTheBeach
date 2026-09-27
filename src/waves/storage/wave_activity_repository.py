@@ -13,11 +13,7 @@ from .schema import SCHEMA_SQL, SCHEMA_VERSION
 
 
 def round_half_up(value: float) -> int:
-    """Округляет до ближайшего целого, половины — вверх (2.5 -> 3).
-
-    Стандартный round() в Python использует банковское округление
-    (2.5 -> 2), что для физических величин нежелательно.
-    """
+    """Округляет до ближайшего целого, половины — вверх (2.5 -> 3)."""
     value = float(value)
 
     if not math.isfinite(value):
@@ -27,10 +23,7 @@ def round_half_up(value: float) -> int:
 
 
 def round_azimuth_deg(azimuth_deg: float) -> int:
-    """Округляет азимут до целого градуса в диапазоне [0, 359].
-
-    Нормализация выполняется после округления, чтобы 359.6 -> 0, а не 360.
-    """
+    """Округляет азимут до целого градуса в диапазоне [0, 359]."""
     return round_half_up(azimuth_deg) % 360
 
 
@@ -77,62 +70,76 @@ class WaveActivitySummaryRow:
     total_energy_mjm: float
 
     @classmethod
+    def _empty(cls, point_id: int, n_days: int) -> "WaveActivitySummaryRow":
+        return cls(
+            point_id=int(point_id),
+            n_days=int(n_days),
+            n_active_days=0,
+            mean_cwef_wm=None,
+            median_cwef_wm=None,
+            std_cwef_wm=None,
+            p75_cwef_wm=None,
+            p90_cwef_wm=None,
+            p95_cwef_wm=None,
+            p99_cwef_wm=None,
+            max_cwef_wm=None,
+            n_storm_days_p90=0,
+            total_energy_mjm=0.0,
+        )
+
+    @classmethod
     def from_powers(
         cls,
         point_id: int,
         powers_wm: Iterable[float],
     ) -> "WaveActivitySummaryRow":
-        """Сводная статистика по исходным (неокруглённым) значениям CWEF."""
+        """Сводная статистика CWEF по точке.
+
+        n_days        — все валидные дни (включая нулевые);
+        n_active_days — дни с CWEF > 0;
+        mean, median, std, перцентили, max, n_storm_days_p90 —
+        только по дням с CWEF > 0;
+        total_energy_mjm — суммарная энергия за период.
+        """
         values = np.asarray(list(powers_wm), dtype=np.float64)
 
         if values.size == 0:
-            return cls(
-                point_id=int(point_id),
-                n_days=0,
-                n_active_days=0,
-                mean_cwef_wm=None,
-                median_cwef_wm=None,
-                std_cwef_wm=None,
-                p75_cwef_wm=None,
-                p90_cwef_wm=None,
-                p95_cwef_wm=None,
-                p99_cwef_wm=None,
-                max_cwef_wm=None,
-                n_storm_days_p90=0,
-                total_energy_mjm=0.0,
-            )
+            return cls._empty(point_id, 0)
 
         if not np.all(np.isfinite(values)):
-            raise ValueError(
-                f"Non-finite CWEF values for point_id={point_id}"
-            )
+            raise ValueError(f"Non-finite CWEF values for point_id={point_id}")
 
         if np.any(values < 0.0):
-            raise ValueError(
-                f"Negative CWEF values for point_id={point_id}"
-            )
+            raise ValueError(f"Negative CWEF values for point_id={point_id}")
 
-        p90 = float(np.quantile(values, 0.90))
+        active = values[values > 0.0]
+
+        if active.size == 0:
+            return cls._empty(point_id, values.size)
+
+        p75, p90, p95, p99 = (
+            float(q) for q in np.quantile(active, [0.75, 0.90, 0.95, 0.99])
+        )
 
         return cls(
             point_id=int(point_id),
             n_days=int(values.size),
-            n_active_days=int(np.count_nonzero(values > 0.0)),
-            mean_cwef_wm=round(float(np.mean(values)), 6),
-            median_cwef_wm=round(float(np.median(values)), 6),
+            n_active_days=int(active.size),
+            mean_cwef_wm=round(float(np.mean(active)), 6),
+            median_cwef_wm=round(float(np.median(active)), 6),
             std_cwef_wm=(
-                round(float(np.std(values, ddof=1)), 6)
-                if values.size > 1
+                round(float(np.std(active, ddof=1)), 6)
+                if active.size > 1
                 else None
             ),
-            p75_cwef_wm=round(float(np.quantile(values, 0.75)), 6),
+            p75_cwef_wm=round(p75, 6),
             p90_cwef_wm=round(p90, 6),
-            p95_cwef_wm=round(float(np.quantile(values, 0.95)), 6),
-            p99_cwef_wm=round(float(np.quantile(values, 0.99)), 6),
-            max_cwef_wm=round(float(np.max(values)), 6),
-            n_storm_days_p90=int(np.count_nonzero(values >= p90)),
+            p95_cwef_wm=round(p95, 6),
+            p99_cwef_wm=round(p99, 6),
+            max_cwef_wm=round(float(np.max(active)), 6),
+            n_storm_days_p90=int(np.count_nonzero(active >= p90)),
             total_energy_mjm=round(
-                float(np.sum(values) * 86_400.0 / 1e6),
+                float(np.sum(active) * 86_400.0 / 1e6),
                 6,
             ),
         )
@@ -222,11 +229,7 @@ class WaveActivityRepository:
         self,
         rows: Iterable[WaveActivityRow],
     ) -> int:
-        """Записывает суточные CWEF, округлённые до целых.
-
-        Дни, у которых округлённый CWEF равен 0, не сохраняются
-        (таблица разреженная, CHECK cwef_wm >= 1).
-        """
+        """Записывает суточные CWEF, округлённые до целых; нули пропускаются."""
         payload: list[tuple[int, int, int, int]] = []
 
         for row in rows:
@@ -434,11 +437,7 @@ class WaveActivityRepository:
     def read_exposure_indices(
         self,
     ) -> list[tuple[WavePointRow, WaveExposureIndexRow]]:
-        """Читает wave_points JOIN wave_exposure_index.
-
-        Возвращает список пар (точка, индекс) в порядке point_id.
-        Точки без записи в wave_exposure_index не включаются.
-        """
+        """Читает wave_points JOIN wave_exposure_index в порядке point_id."""
         rows = self._con.execute(
             """
             SELECT

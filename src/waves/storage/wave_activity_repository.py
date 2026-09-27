@@ -406,3 +406,75 @@ class WaveActivityRepository:
     def optimize(self) -> None:
         self._con.execute("PRAGMA optimize")
         self._con.commit()
+
+    def read_exposure_indices(
+        self,
+    ) -> list[tuple[WavePointRow, WaveExposureIndexRow]]:
+        """Читает wave_points JOIN wave_exposure_index.
+
+        Возвращает список пар (точка, индекс) в порядке point_id.
+        Точки без записи в wave_exposure_index не включаются.
+        """
+        rows = self._con.execute(
+            """
+            SELECT
+                p.id,
+                p.lon,
+                p.lat,
+                p.normal_x,
+                p.normal_y,
+                p.normal_azimuth_deg,
+                i.mean_cwef_wm,
+                i.e_storm_mjm,
+                i.storm_threshold_wm,
+                i.storm_percentile,
+                i.k_dir,
+                i.cv,
+                i.n_days,
+                i.n_storm_days,
+                i.top3_sectors,
+                i.r1,
+                i.r2,
+                i.r3,
+                i.r4,
+                i.wer
+            FROM wave_points AS p
+            INNER JOIN wave_exposure_index AS i
+                ON i.point_id = p.id
+            ORDER BY p.id
+            """
+        ).fetchall()
+
+        result: list[
+            tuple[WavePointRow, WaveExposureIndexRow]
+        ] = []
+
+        for row in rows:
+            point = WavePointRow(
+                id=int(row[0]),
+                lon=float(row[1]),
+                lat=float(row[2]),
+                normal_x=float(row[3]),
+                normal_y=float(row[4]),
+                normal_azimuth_deg=float(row[5]),
+            )
+            index = WaveExposureIndexRow(
+                point_id=int(row[0]),
+                mean_cwef_wm=row[6],
+                e_storm_mjm=row[7],
+                storm_threshold_wm=row[8],
+                storm_percentile=row[9],
+                k_dir=row[10],
+                cv=row[11],
+                n_days=int(row[12]),
+                n_storm_days=int(row[13]),
+                top3_sectors=row[14],
+                r1=row[15],
+                r2=row[16],
+                r3=row[17],
+                r4=row[18],
+                wer=row[19],
+            )
+            result.append((point, index))
+
+        return result

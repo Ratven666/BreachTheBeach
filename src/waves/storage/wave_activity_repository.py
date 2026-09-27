@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
@@ -11,14 +12,44 @@ import numpy as np
 from .schema import SCHEMA_SQL, SCHEMA_VERSION
 
 
+def round_half_up(value: float) -> int:
+    """Округляет до ближайшего целого, половины — вверх (2.5 -> 3).
+
+    Стандартный round() в Python использует банковское округление
+    (2.5 -> 2), что для физических величин нежелательно.
+    """
+    value = float(value)
+
+    if not math.isfinite(value):
+        raise ValueError(f"Cannot round non-finite value: {value}")
+
+    return int(math.floor(value + 0.5))
+
+
+def round_azimuth_deg(azimuth_deg: float) -> int:
+    """Округляет азимут до целого градуса в диапазоне [0, 359].
+
+    Нормализация выполняется после округления, чтобы 359.6 -> 0, а не 360.
+    """
+    return round_half_up(azimuth_deg) % 360
+
+
+def round_cwef_wm(cwef_wm: float) -> int:
+    """Округляет суточный CWEF до целого, Вт/м."""
+    value = float(cwef_wm)
+
+    if value < 0.0:
+        raise ValueError(f"Negative CWEF value: {value}")
+
+    return round_half_up(value)
+
+
 @dataclass(frozen=True, slots=True)
 class WavePointRow:
     id: int
     lon: float
     lat: float
-    normal_x: float
-    normal_y: float
-    normal_azimuth_deg: float
+    normal_azimuth_deg: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +57,7 @@ class WaveActivityRow:
     point_id: int
     day: int
     wind_azimuth_deg: int
-    cwef_wm: float
+    cwef_wm: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,11 +82,12 @@ class WaveActivitySummaryRow:
         point_id: int,
         powers_wm: Iterable[float],
     ) -> "WaveActivitySummaryRow":
+        """Сводная статистика по исходным (неокруглённым) значениям CWEF."""
         values = np.asarray(list(powers_wm), dtype=np.float64)
 
         if values.size == 0:
             return cls(
-                point_id=point_id,
+                point_id=int(point_id),
                 n_days=0,
                 n_active_days=0,
                 mean_cwef_wm=None,
@@ -93,23 +125,12 @@ class WaveActivitySummaryRow:
                 if values.size > 1
                 else None
             ),
-            p75_cwef_wm=round(
-                float(np.quantile(values, 0.75)),
-                6,
-            ),
+            p75_cwef_wm=round(float(np.quantile(values, 0.75)), 6),
             p90_cwef_wm=round(p90, 6),
-            p95_cwef_wm=round(
-                float(np.quantile(values, 0.95)),
-                6,
-            ),
-            p99_cwef_wm=round(
-                float(np.quantile(values, 0.99)),
-                6,
-            ),
+            p95_cwef_wm=round(float(np.quantile(values, 0.95)), 6),
+            p99_cwef_wm=round(float(np.quantile(values, 0.99)), 6),
             max_cwef_wm=round(float(np.max(values)), 6),
-            n_storm_days_p90=int(
-                np.count_nonzero(values >= p90)
-            ),
+            n_storm_days_p90=int(np.count_nonzero(values >= p90)),
             total_energy_mjm=round(
                 float(np.sum(values) * 86_400.0 / 1e6),
                 6,
@@ -151,28 +172,25 @@ class WaveActivityRepository:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if exc_type is None:
-            self._con.commit()
-        else:
-            self._con.rollback()
-
-        self.close()
+        try:
+            if exc_type is None:
+                self._con.commit()
+            else:
+                self._con.rollback()
+        finally:
+            self.close()
 
     def close(self) -> None:
         self._con.close()
 
     def initialize(self) -> None:
         self._con.executescript(SCHEMA_SQL)
-        self._con.execute(
-            f"PRAGMA user_version = {SCHEMA_VERSION}"
-        )
+        self._con.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
         self._con.commit()
 
     def assert_schema_version(self) -> None:
         version = int(
-            self._con.execute(
-                "PRAGMA user_version"
-            ).fetchone()[0]
+            self._con.execute("PRAGMA user_version").fetchone()[0]
         )
 
         if version != SCHEMA_VERSION:
@@ -189,46 +207,54 @@ class WaveActivityRepository:
                 id,
                 lon,
                 lat,
-                normal_x,
-                normal_y,
                 normal_azimuth_deg
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?)
             """,
             (
                 int(point.id),
                 float(point.lon),
                 float(point.lat),
-                float(point.normal_x),
-                float(point.normal_y),
-                float(point.normal_azimuth_deg) % 360.0,
+                round_azimuth_deg(point.normal_azimuth_deg),
             ),
         )
 
     def add_activity(
-            self,
-            rows: Iterable[WaveActivityRow],
+        self,
+        rows: Iterable[WaveActivityRow],
     ) -> int:
-        payload = [
-            (
-                int(row.point_id),
-                int(row.day),
-                int(row.wind_azimuth_deg) % 360,
-                float(row.cwef_wm),
+        """Записывает суточные CWEF, округлённые до целых.
+
+        Дни, у которых округлённый CWEF равен 0, не сохраняются
+        (таблица разреженная, CHECK cwef_wm >= 1).
+        """
+        payload: list[tuple[int, int, int, int]] = []
+
+        for row in rows:
+            cwef_int = round_cwef_wm(row.cwef_wm)
+
+            if cwef_int < 1:
+                continue
+
+            payload.append(
+                (
+                    int(row.point_id),
+                    int(row.day),
+                    int(row.wind_azimuth_deg) % 360,
+                    cwef_int,
+                )
             )
-            for row in rows
-            if float(row.cwef_wm) > 0.0  # <-- добавить эту строку
-        ]
 
         if not payload:
             return 0
 
         self._con.executemany(
             """
-            INSERT INTO wave_activity (point_id,
-                                       day,
-                                       wind_azimuth_deg,
-                                       cwef_wm)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO wave_activity (
+                point_id,
+                day,
+                wind_azimuth_deg,
+                cwef_wm
+            ) VALUES (?, ?, ?, ?)
             """,
             payload,
         )
@@ -339,7 +365,7 @@ class WaveActivityRepository:
                 point_id=int(row[0]),
                 day=int(row[1]),
                 wind_azimuth_deg=int(row[2]),
-                cwef_wm=float(row[3]),
+                cwef_wm=int(row[3]),
             )
             result[item.point_id].append(item)
 
@@ -370,9 +396,7 @@ class WaveActivityRepository:
             for row in rows
         ]
 
-        self._con.execute(
-            "DELETE FROM wave_exposure_index"
-        )
+        self._con.execute("DELETE FROM wave_exposure_index")
 
         if payload:
             self._con.executemany(
@@ -421,8 +445,6 @@ class WaveActivityRepository:
                 p.id,
                 p.lon,
                 p.lat,
-                p.normal_x,
-                p.normal_y,
                 p.normal_azimuth_deg,
                 i.mean_cwef_wm,
                 i.e_storm_mjm,
@@ -445,35 +467,31 @@ class WaveActivityRepository:
             """
         ).fetchall()
 
-        result: list[
-            tuple[WavePointRow, WaveExposureIndexRow]
-        ] = []
+        result: list[tuple[WavePointRow, WaveExposureIndexRow]] = []
 
         for row in rows:
             point = WavePointRow(
                 id=int(row[0]),
                 lon=float(row[1]),
                 lat=float(row[2]),
-                normal_x=float(row[3]),
-                normal_y=float(row[4]),
-                normal_azimuth_deg=float(row[5]),
+                normal_azimuth_deg=int(row[3]),
             )
             index = WaveExposureIndexRow(
                 point_id=int(row[0]),
-                mean_cwef_wm=row[6],
-                e_storm_mjm=row[7],
-                storm_threshold_wm=row[8],
-                storm_percentile=row[9],
-                k_dir=row[10],
-                cv=row[11],
-                n_days=int(row[12]),
-                n_storm_days=int(row[13]),
-                top3_sectors=row[14],
-                r1=row[15],
-                r2=row[16],
-                r3=row[17],
-                r4=row[18],
-                wer=row[19],
+                mean_cwef_wm=row[4],
+                e_storm_mjm=row[5],
+                storm_threshold_wm=row[6],
+                storm_percentile=row[7],
+                k_dir=row[8],
+                cv=row[9],
+                n_days=int(row[10]),
+                n_storm_days=int(row[11]),
+                top3_sectors=row[12],
+                r1=row[13],
+                r2=row[14],
+                r3=row[15],
+                r4=row[16],
+                wer=row[17],
             )
             result.append((point, index))
 

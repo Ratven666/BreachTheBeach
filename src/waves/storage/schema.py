@@ -3,22 +3,21 @@ from __future__ import annotations
 from src.weather_history.archive.schema import MAX_DAY_OFFSET
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = f"""
 CREATE TABLE wave_points (
     id INTEGER PRIMARY KEY,
     lon REAL NOT NULL CHECK (lon BETWEEN -180.0 AND 180.0),
     lat REAL NOT NULL CHECK (lat BETWEEN -90.0 AND 90.0),
-    normal_x REAL NOT NULL,
-    normal_y REAL NOT NULL,
-    normal_azimuth_deg REAL NOT NULL CHECK (
-        normal_azimuth_deg >= 0.0
-        AND normal_azimuth_deg < 360.0
+
+    -- Азимут нормали, округлённый до целого градуса: int(round(az)) % 360.
+    normal_azimuth_deg INTEGER NOT NULL CHECK (
+        normal_azimuth_deg BETWEEN 0 AND 359
     )
 ) STRICT;
 
--- Таблица разреженная: в ней хранятся только дни с CWEF > 0.
+-- Таблица разреженная: в ней хранятся только дни с округлённым CWEF >= 1.
 -- Полное число обработанных дней хранится в wave_activity_summary.n_days.
 CREATE TABLE wave_activity (
     point_id INTEGER NOT NULL,
@@ -28,9 +27,12 @@ CREATE TABLE wave_activity (
     wind_azimuth_deg INTEGER NOT NULL CHECK (
         wind_azimuth_deg BETWEEN 0 AND 359
     ),
-    cwef_wm REAL NOT NULL CHECK (
-        cwef_wm > 0.0
+
+    -- Суточный CWEF, округлённый до целого, Вт/м.
+    cwef_wm INTEGER NOT NULL CHECK (
+        cwef_wm >= 1
     ),
+
     PRIMARY KEY (point_id, day),
     FOREIGN KEY (point_id)
         REFERENCES wave_points(id)
@@ -46,7 +48,7 @@ CREATE TABLE wave_activity_summary (
     --   * дни с нулевым CWEF.
     n_days INTEGER NOT NULL CHECK (n_days >= 0),
 
-    -- Число дней с CWEF > 0.
+    -- Число дней с CWEF > 0 (до округления).
     n_active_days INTEGER NOT NULL CHECK (
         n_active_days >= 0
         AND n_active_days <= n_days

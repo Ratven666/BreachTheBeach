@@ -105,13 +105,17 @@ class TestInit:
         with pytest.raises(TypeError, match="numeric"):
             CoastlineNormalPointSet(gdf)
 
-    def test_sea_side_cast_to_str(self):
-        import pandas as pd
+    def test_sea_side_normalized_to_lowercase_str(self):
         gdf = _make_gdf()
-        gdf["sea_side"] = 1  # int → должен стать str
+        gdf["sea_side"] = "RIGHT"
         ps = CoastlineNormalPointSet(gdf)
-        # Проверяем, что значения стали строками, а не числами
-        assert pd.api.types.is_string_dtype(ps.gdf["sea_side"])
+        assert set(ps.gdf["sea_side"]) == {"right"}
+
+    def test_invalid_sea_side_rejected(self):
+        gdf = _make_gdf()
+        gdf["sea_side"] = 1
+        with pytest.raises(ValueError, match="sea_side"):
+            CoastlineNormalPointSet(gdf)
 
     def test_index_reset(self):
         gdf = _make_gdf(n=10).iloc[3:8]  # несброшенный индекс

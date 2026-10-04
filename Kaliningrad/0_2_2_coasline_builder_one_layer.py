@@ -17,12 +17,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.coastline.domain import CoastlineDataset
 
 # ── Вход / выход ─────────────────────────────────────────────────────────────
-INPUT_PATH = PROJECT_ROOT / "Kaliningrad" / "data" / "coastline" / "kaliningrad_OFFSET.geojson"
-OUTPUT_PATH = PROJECT_ROOT / "Kaliningrad" / "data" / "coastline" / "kaliningrad_OFFSET_coastline_merged.geojson"
+INPUT_PATH = PROJECT_ROOT / "Kaliningrad" / "data" / "coastline" / "KaliningradOSM.geojson"
+OUTPUT_PATH = PROJECT_ROOT / "Kaliningrad" / "data" / "coastline" / "KaliningradOSM_merged.geojson"
 OUTPUT_CRS: str | None = None      # None → CRS исходного файла
 
 # ── Параметры сшивки ─────────────────────────────────────────────────────────
-SNAP_TOLERANCE_M = 10.0   # концы ближе этого расстояния считаются общей точкой (0 = без снаппинга)
+SNAP_TOLERANCE_M = 25.0   # концы ближе этого расстояния считаются общей точкой (0 = без снаппинга)
 DIRECTED = False         # True: не разворачивать отрезки, сшивать только конец→начало
 MIN_LENGTH_M = 100.0       # отбросить обрывки короче (0 = не фильтровать)
 

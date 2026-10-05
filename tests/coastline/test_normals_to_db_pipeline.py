@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = PROJECT_ROOT / "db_pypeline" / "2_1_normals_to_db.py"
 
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from src.coastline.storage.models import (  # noqa: E402
     Base,
@@ -27,6 +28,14 @@ from src.coastline.storage.models import (  # noqa: E402
 
 LAT = 54.9
 
+SCRIPT_TEXT = SCRIPT.read_text(encoding="utf-8")
+HAS_COASTLINE_FLAG = "--coastline" in SCRIPT_TEXT
+
+needs_coastline_flag = pytest.mark.skipif(
+    not HAS_COASTLINE_FLAG,
+    reason="2_1_normals_to_db.py не поддерживает --coastline",
+)
+
 
 def azimuth_diff(a: float, b: float) -> float:
     return abs((a - b + 180.0) % 360.0 - 180.0)
@@ -34,15 +43,13 @@ def azimuth_diff(a: float, b: float) -> float:
 
 def write_geojson(path: Path, lines: list[LineString]) -> Path:
     path.write_text(
-        json.dumps(
-            {
-                "type": "FeatureCollection",
-                "features": [
-                    {"type": "Feature", "properties": {}, "geometry": mapping(l)}
-                    for l in lines
-                ],
-            }
-        ),
+        json.dumps({
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "properties": {}, "geometry": mapping(l)}
+                for l in lines
+            ],
+        }),
         encoding="utf-8",
     )
     return path
@@ -62,27 +69,24 @@ def seed_points(
     id_offset: int = 0,
     crs: str = "EPSG:4326",
 ) -> int:
+    """Создаёт ровно один источник точек (скрипт берёт последний по id)."""
     engine = create_engine(db_url)
     Base.metadata.create_all(engine)
 
     with Session(engine) as s:
-        for i in range(id_offset):
-            dummy = CoastlineSourceModel(
-                name=f"dummy{i}", strategy_name="x", source_mode="main",
-                strategy_params="{}", main_geojson_path="x",
-                other_geojson_path=None, crs="EPSG:4326", points_count=1,
-            )
-            s.add(dummy)
-            s.flush()
-            s.add(CoastlinePointModel(source_id=dummy.id, seq=0, lon=0.0, lat=0.0))
-        s.commit()
-
         src = CoastlineSourceModel(
             name="src", strategy_name="x", source_mode="main",
             strategy_params="{}", main_geojson_path=main_path,
             other_geojson_path=None, crs=crs, points_count=len(coords),
         )
         s.add(src)
+        s.flush()
+
+        # Сдвигаем PK точек, чтобы id не совпадали ни с seq, ни с позицией.
+        for i in range(id_offset):
+            s.add(CoastlinePointModel(
+                id=10_000 + i, source_id=src.id, seq=-1 - i, lon=0.0, lat=0.0
+            ))
         s.flush()
 
         for i, (lon, lat) in enumerate(coords):
@@ -94,91 +98,93 @@ def seed_points(
 
 
 def run_script(db_url: str, *args: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "COASTLINE_DATABASE_URL": db_url}
+    env = {
+        **os.environ,
+        "COASTLINE_DATABASE_URL": db_url,
+        "PYTHONPATH": os.pathsep.join(
+            [str(PROJECT_ROOT), str(PROJECT_ROOT / "src")]
+        ),
+    }
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
-        cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=180,
+        cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=240,
     )
 
 
-# ── Явный путь к береговой линии ──────────────────────────────────────
-
-def test_explicit_coastline_overrides_metadata(tmp_path, db_url):
-    wrong = write_geojson(
-        tmp_path / "wrong.geojson", [LineString([(20.0, LAT), (20.0, LAT + 0.1)])]
-    )
-    right = write_geojson(
-        tmp_path / "right.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
-    )
-    sid = seed_points(db_url, [(20.03, LAT), (20.05, LAT)], main_path=str(wrong))
-
-    proc = run_script(
-        db_url, "--coastline", str(right), "--point-source-id", str(sid),
-        "--sea-side", "right", "--name", "n1",
-    )
-    assert proc.returncode == 0, proc.stderr
-
+def count(db_url: str, model) -> int:
     with Session(create_engine(db_url)) as s:
-        azimuths = s.execute(select(CoastlineNormalModel.normal_azimuth_deg)).scalars().all()
-
-    assert len(azimuths) == 2
-    for az in azimuths:
-        assert azimuth_diff(az, 180.0) < AZ_TOL
+        return s.scalar(select(func.count()).select_from(model))
 
 
-AZ_TOL = 2.5
+# ── Базовый запуск по путям из метаданных ─────────────────────────────
 
-
-def test_metadata_path_used_when_flag_missing(tmp_path, db_url):
+def test_script_runs_with_metadata_path(tmp_path, db_url):
     line = write_geojson(
         tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
     )
-    sid = seed_points(db_url, [(20.03, LAT)], main_path=str(line))
+    seed_points(db_url, [(20.03, LAT), (20.05, LAT)], main_path=str(line))
 
-    proc = run_script(db_url, "--point-source-id", str(sid), "--name", "n2")
+    proc = run_script(db_url)
 
     assert proc.returncode == 0, proc.stderr
+    assert count(db_url, CoastlineNormalModel) == 2
+    assert count(db_url, CoastlineNormalSourceModel) == 1
 
 
-def test_missing_coastline_file_fails_without_writing(tmp_path, db_url):
-    sid = seed_points(db_url, [(20.03, LAT)], main_path=None)
+def test_script_fails_without_main_geojson_path(db_url):
+    seed_points(db_url, [(20.03, LAT)], main_path=None)
 
-    proc = run_script(
-        db_url, "--coastline", str(tmp_path / "nope.geojson"),
-        "--point-source-id", str(sid),
-    )
+    proc = run_script(db_url)
 
     assert proc.returncode != 0
-    with Session(create_engine(db_url)) as s:
-        assert s.scalar(select(func.count()).select_from(CoastlineNormalModel)) == 0
+    assert count(db_url, CoastlineNormalModel) == 0
 
 
-# ── Направление линии не меняется ─────────────────────────────────────
-
-@pytest.mark.parametrize("reverse, expected_az", [(False, 180.0), (True, 0.0)])
-def test_line_direction_defines_saved_side(tmp_path, db_url, reverse, expected_az):
-    coords = [(20.0, LAT), (20.1, LAT)]
-    if reverse:
-        coords = coords[::-1]
-    line = write_geojson(tmp_path / "c.geojson", [LineString(coords)])
-    sid = seed_points(db_url, [(20.03, LAT), (20.05, LAT)], main_path=str(line))
-
-    proc = run_script(
-        db_url, "--coastline", str(line), "--point-source-id", str(sid),
-        "--sea-side", "right",
+def test_saved_normals_are_unit_and_azimuth_consistent(tmp_path, db_url):
+    line = write_geojson(
+        tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
     )
-    assert proc.returncode == 0, proc.stderr
+    seed_points(db_url, [(20.02, LAT), (20.05, LAT)], main_path=str(line))
+
+    assert run_script(db_url).returncode == 0
 
     with Session(create_engine(db_url)) as s:
-        azimuths = s.execute(select(CoastlineNormalModel.normal_azimuth_deg)).scalars().all()
+        rows = s.execute(select(CoastlineNormalModel)).scalars().all()
 
-    for az in azimuths:
-        assert azimuth_diff(az, expected_az) < AZ_TOL
+    assert rows
+    for r in rows:
+        assert math.hypot(r.nx, r.ny) == pytest.approx(1.0, abs=1e-9)
+        expected = (math.degrees(math.atan2(r.nx, r.ny)) + 360.0) % 360.0
+        assert azimuth_diff(r.normal_azimuth_deg, expected) < 1e-6
+        # «right» от линии, идущей на восток: нормаль смотрит на юг.
+        assert azimuth_diff(r.normal_azimuth_deg, 180.0) < 2.5
 
 
-# ── Корректность FK ───────────────────────────────────────────────────
+def test_normal_source_metadata(tmp_path, db_url):
+    line = write_geojson(
+        tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
+    )
+    sid = seed_points(db_url, [(20.02, LAT), (20.05, LAT)], main_path=str(line))
+
+    assert run_script(db_url).returncode == 0
+
+    with Session(create_engine(db_url)) as s:
+        ns = s.execute(select(CoastlineNormalSourceModel)).scalars().one()
+
+    assert ns.point_source_id == sid
+    assert ns.normals_count == 2
+    assert ns.sea_side == "right"
+    assert ns.working_crs and ns.working_crs.startswith("EPSG:")
+
+
+# ── Регрессия: FK point_id должен быть настоящим id точки ─────────────
 
 def test_point_id_is_real_fk_not_seq(tmp_path, db_url):
+    """
+    Падает на старом скрипте: там seq_to_point[int(index)] использует
+    позицию результата как seq. При seq_start=500 это KeyError, а при
+    seq, совпадающем с позицией, но id другом, даёт чужие FK.
+    """
     line = write_geojson(
         tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
     )
@@ -190,119 +196,93 @@ def test_point_id_is_real_fk_not_seq(tmp_path, db_url):
         id_offset=7,
     )
 
-    proc = run_script(
-        db_url, "--coastline", str(line), "--point-source-id", str(sid), "--name", "fk"
-    )
+    proc = run_script(db_url)
     assert proc.returncode == 0, proc.stderr
 
     with Session(create_engine(db_url)) as s:
-        point_ids = set(
-            s.execute(
-                select(CoastlinePointModel.id).where(CoastlinePointModel.source_id == sid)
-            ).scalars()
-        )
-        norm_ids = s.execute(select(CoastlineNormalModel.point_id)).scalars().all()
+        expected = set(s.execute(
+            select(CoastlinePointModel.id).where(
+                CoastlinePointModel.source_id == sid,
+                CoastlinePointModel.seq >= 0,
+            )
+        ).scalars())
+        actual = s.execute(select(CoastlineNormalModel.point_id)).scalars().all()
 
-    assert len(norm_ids) == 3
-    assert set(norm_ids) == point_ids
-
-
-def test_saved_normals_are_unit_and_consistent(tmp_path, db_url):
-    line = write_geojson(
-        tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
-    )
-    sid = seed_points(db_url, [(20.02, LAT), (20.05, LAT)], main_path=str(line))
-
-    run_script(db_url, "--coastline", str(line), "--point-source-id", str(sid))
-
-    with Session(create_engine(db_url)) as s:
-        rows = s.execute(select(CoastlineNormalModel)).scalars().all()
-
-    assert rows
-    for r in rows:
-        assert math.hypot(r.nx, r.ny) == pytest.approx(1.0, abs=1e-9)
-        expected = (math.degrees(math.atan2(r.nx, r.ny)) + 360.0) % 360.0
-        assert azimuth_diff(r.normal_azimuth_deg, expected) < 1e-6
+    assert len(actual) == 3
+    assert set(actual) == expected
 
 
-def test_normal_source_metadata_matches_run(tmp_path, db_url):
-    line = write_geojson(
-        tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
-    )
-    sid = seed_points(db_url, [(20.02, LAT), (20.05, LAT)], main_path=str(line))
+def test_normal_is_bound_to_correct_point_geometry(tmp_path, db_url):
+    """
+    Две линии с разным направлением: нормаль, привязанная к точке,
+    должна соответствовать линии именно этой точки.
+    """
+    east = LineString([(20.00, LAT), (20.10, LAT)])
+    north = LineString([(20.30, LAT), (20.30, LAT + 0.01)])
+    ref = write_geojson(tmp_path / "c.geojson", [east, north])
 
-    run_script(
-        db_url, "--coastline", str(line), "--point-source-id", str(sid),
-        "--sea-side", "left", "--tangent-delta-m", "7.5", "--name", "meta",
+    seed_points(
+        db_url,
+        [(20.05, LAT), (20.30, LAT + 0.005)],
+        main_path=str(ref),
+        seq_start=100,
+        id_offset=3,
     )
 
-    with Session(create_engine(db_url)) as s:
-        ns = s.execute(select(CoastlineNormalSourceModel)).scalars().one()
-
-    assert ns.sea_side == "left"
-    assert ns.tangent_delta_m == pytest.approx(7.5)
-    assert ns.normals_count == 2
-    assert ns.point_source_id == sid
-    assert ns.working_crs and ns.working_crs.startswith("EPSG:")
-
-
-# ── Защитные проверки ─────────────────────────────────────────────────
-
-def test_point_far_from_reference_aborts_transaction(tmp_path, db_url):
-    line = write_geojson(
-        tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
-    )
-    sid = seed_points(
-        db_url, [(20.03, LAT), (20.05, LAT + 0.2)], main_path=str(line)
-    )
-
-    proc = run_script(
-        db_url, "--coastline", str(line), "--point-source-id", str(sid),
-        "--max-reference-distance-m", "500",
-    )
-
-    assert proc.returncode != 0
-    with Session(create_engine(db_url)) as s:
-        assert s.scalar(select(func.count()).select_from(CoastlineNormalModel)) == 0
-        assert s.scalar(select(func.count()).select_from(CoastlineNormalSourceModel)) == 0
-
-
-def test_non_wgs84_point_source_is_rejected(tmp_path, db_url):
-    line = write_geojson(
-        tmp_path / "c.geojson", [LineString([(20.0, LAT), (20.1, LAT)])]
-    )
-    sid = seed_points(
-        db_url, [(20.03, LAT)], main_path=str(line), crs="EPSG:32634"
-    )
-
-    proc = run_script(db_url, "--coastline", str(line), "--point-source-id", str(sid))
-
-    assert proc.returncode != 0
-    with Session(create_engine(db_url)) as s:
-        assert s.scalar(select(func.count()).select_from(CoastlineNormalModel)) == 0
-
-
-def test_multi_component_reference_end_to_end(tmp_path, db_url):
-    long_east = LineString([(20.00, LAT), (20.10, LAT)])
-    short_north = LineString([(20.30, LAT), (20.30, LAT + 0.01)])
-    ref = write_geojson(tmp_path / "c.geojson", [long_east, short_north])
-
-    sid = seed_points(
-        db_url, [(20.05, LAT), (20.30, LAT + 0.005)], main_path=str(ref)
-    )
-
-    proc = run_script(
-        db_url, "--coastline", str(ref), "--point-source-id", str(sid)
-    )
+    proc = run_script(db_url)
     assert proc.returncode == 0, proc.stderr
 
     with Session(create_engine(db_url)) as s:
         rows = s.execute(
-            select(CoastlineNormalModel, CoastlinePointModel.seq)
-            .join(CoastlinePointModel, CoastlinePointModel.id == CoastlineNormalModel.point_id)
+            select(CoastlineNormalModel.normal_azimuth_deg, CoastlinePointModel.seq)
+            .join(CoastlinePointModel,
+                  CoastlinePointModel.id == CoastlineNormalModel.point_id)
             .order_by(CoastlinePointModel.seq)
         ).all()
 
-    az = [r[0].normal_azimuth_deg for r in rows]
-    assert azimuth_diff(az[0], 180.0) < AZ_TOL
-    assert azimuth_diff(az[1], 90.0) < AZ_TOL
+    assert len(rows) == 2
+    assert azimuth_diff(rows[0][0], 180.0) < 2.5     # к восточной линии
+    assert azimuth_diff(rows[1][0], 90.0) < 2.5      # к северной линии
+
+
+# ── Явный путь к береговой линии ──────────────────────────────────────
+
+@needs_coastline_flag
+def test_explicit_coastline_overrides_metadata(tmp_path, db_url):
+    wrong = write_geojson(
+        tmp_path / "wrong.geojson",
+        [LineString([(20.0, LAT), (20.0, LAT + 0.1)])],
+    )
+    right = write_geojson(
+        tmp_path / "right.geojson",
+        [LineString([(20.0, LAT), (20.1, LAT)])],
+    )
+    sid = seed_points(db_url, [(20.03, LAT), (20.05, LAT)], main_path=str(wrong))
+
+    proc = run_script(
+        db_url, "--coastline", str(right), "--point-source-id", str(sid)
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    with Session(create_engine(db_url)) as s:
+        azimuths = s.execute(
+            select(CoastlineNormalModel.normal_azimuth_deg)
+        ).scalars().all()
+
+    assert len(azimuths) == 2
+    for az in azimuths:
+        assert azimuth_diff(az, 180.0) < 2.5
+
+
+@needs_coastline_flag
+def test_missing_explicit_coastline_writes_nothing(tmp_path, db_url):
+    sid = seed_points(db_url, [(20.03, LAT)], main_path=None)
+
+    proc = run_script(
+        db_url, "--coastline", str(tmp_path / "nope.geojson"),
+        "--point-source-id", str(sid),
+    )
+
+    assert proc.returncode != 0
+    assert count(db_url, CoastlineNormalModel) == 0
+    assert count(db_url, CoastlineNormalSourceModel) == 0

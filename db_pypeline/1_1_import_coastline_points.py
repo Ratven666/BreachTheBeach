@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from src.coastline.storage.models import Base, CoastlineSourceModel, CoastlinePointModel
-
 """
 db_pypeline/1_1_import_coastline_points.py
 
@@ -16,23 +14,35 @@ from pathlib import Path
 
 from loguru import logger
 
-sys.path.insert(0, str(Path(__file__).parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.coastline.storage.models import (  # noqa: E402
+    Base,
+    CoastlinePointModel,
+    CoastlineSourceModel,
+)
 
 # ── Конфигурация ──────────────────────────────────────────────────────
-_SCRIPT_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = _SCRIPT_DIR / "data" / "db" / "coastline.db"
+DATABASE_PATH = PROJECT_ROOT / "db_pypeline" / "data" / "db" / "coastline.db"
 
-COASTLINE_MAIN_PATH  = Path("data/coastline/nvrsk_main_coastline.geojson")
+COASTLINE_MAIN_PATH = Path("data/coastline/nvrsk_main_coastline.geojson")
 COASTLINE_OTHER_PATH: Path | None = None
 
-DATASET_NAME    = "nvrsk_main_coastline"
+DATASET_NAME = "nvrsk_main_coastline"
 STRATEGY_STEP_M = 200.0
-INPUT_CRS       = "EPSG:4326"
+INPUT_CRS = "EPSG:4326"
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _abs(path: Path) -> Path:
+    p = path.expanduser()
+    return (p if p.is_absolute() else PROJECT_ROOT / p).resolve()
 
 
 def setup_env() -> None:
     if "COASTLINE_DATABASE_URL" not in os.environ:
+        DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
         url = f"sqlite:///{DATABASE_PATH.resolve().as_posix()}"
         os.environ["COASTLINE_DATABASE_URL"] = url
         logger.debug(f"COASTLINE_DATABASE_URL → {url}")
@@ -49,14 +59,17 @@ def main() -> None:
     from src.coastline.services import CoastlinePointExtractor
     from src.coastline.storage import db as _db
 
-    # 1. Инициализация схемы
-    Base.metadata.create_all(_db.engine)
-    logger.info("DB schema ready")
+    main_path = _abs(COASTLINE_MAIN_PATH)
+    other_path = _abs(COASTLINE_OTHER_PATH) if COASTLINE_OTHER_PATH else None
+    if not main_path.is_file():
+        raise FileNotFoundError(f"Main coastline not found: {main_path}")
 
-    # 2. Датасет береговой линии
+    Base.metadata.create_all(_db.engine)
+    logger.info(f"DB: {os.environ['COASTLINE_DATABASE_URL']}")
+
     dataset = CoastlineDataset.from_geojson(
-        main_path=str(COASTLINE_MAIN_PATH),
-        other_path=str(COASTLINE_OTHER_PATH) if COASTLINE_OTHER_PATH else None,
+        main_path=str(main_path),
+        other_path=str(other_path) if other_path else None,
         name=DATASET_NAME,
     )
     logger.info(
@@ -64,7 +77,6 @@ def main() -> None:
         f"other={len(dataset.other_gdf)} feat, crs={dataset.crs}"
     )
 
-    # 3. Стратегия и извлечение точек
     strategy = EqualStepAlongLineStrategy(
         step_m=STRATEGY_STEP_M,
         source=PointSource.MAIN_ONLY,
@@ -74,32 +86,28 @@ def main() -> None:
     )
     strategy_params = json.dumps(
         {
-            "step_m":            STRATEGY_STEP_M,
-            "source":            PointSource.MAIN_ONLY.value,
+            "step_m": STRATEGY_STEP_M,
+            "source": PointSource.MAIN_ONLY.value,
             "include_endpoints": True,
-            "working_crs":       None,
-            "input_crs":         INPUT_CRS,
+            "working_crs": None,
+            "input_crs": INPUT_CRS,
         },
         ensure_ascii=False,
     )
 
-    extractor = CoastlinePointExtractor()
-    point_set = extractor.extract(dataset=dataset, strategy=strategy, name=DATASET_NAME)
+    point_set = CoastlinePointExtractor().extract(
+        dataset=dataset, strategy=strategy, name=DATASET_NAME
+    )
     point_set.print_summary()
 
-    # 4. Запись в БД
     with _db.SessionLocal() as session:
-
         source = CoastlineSourceModel(
             name=point_set.meta.name,
             strategy_name=point_set.meta.strategy_name,
             source_mode=point_set.meta.source_mode,
             strategy_params=strategy_params,
-            main_geojson_path=str(COASTLINE_MAIN_PATH.resolve()),
-            other_geojson_path=(
-                str(COASTLINE_OTHER_PATH.resolve())
-                if COASTLINE_OTHER_PATH else None
-            ),
+            main_geojson_path=str(main_path),
+            other_geojson_path=str(other_path) if other_path else None,
             crs=str(point_set.gdf.crs) if point_set.gdf.crs else None,
             points_count=len(point_set.gdf),
         )
@@ -109,17 +117,15 @@ def main() -> None:
         rows_data = [
             {
                 "source_id": source.id,
-                "seq":       int(seq),
-                "lon":       float(row.geometry.x),
-                "lat":       float(row.geometry.y),
+                "seq": int(seq),
+                "lon": float(row.geometry.x),
+                "lat": float(row.geometry.y),
             }
             for seq, row in point_set.gdf.iterrows()
         ]
         session.execute(insert(CoastlinePointModel), rows_data)
 
-        saved_id   = source.id
-        saved_name = source.name
-
+        saved_id, saved_name = source.id, source.name
         session.commit()
 
     logger.success(

@@ -5,9 +5,17 @@ from __future__ import annotations
 Поддерживаемые режимы:
     points   — каждая точка как Point-объект (lon, lat из wave_points)
     summary  — те же поля + сводная статистика из wave_activity_summary
+
+Компоненты нормали normal_x / normal_y в БД не хранятся. Они
+восстанавливаются из азимута нормали (от севера по часовой стрелке):
+    normal_x = sin(azimuth)   — составляющая «на восток»
+    normal_y = cos(azimuth)   — составляющая «на север»
+Азимут в БД округлён до целого градуса, поэтому точность компонент
+около 0.5°.
 """
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -40,6 +48,12 @@ def _i(value: int | None) -> int | None:
     return int(value)
 
 
+def _normal_components(azimuth_deg: float) -> tuple[float, float]:
+    """Единичный вектор нормали (east, north) по азимуту от севера."""
+    azimuth_rad = math.radians(float(azimuth_deg))
+    return math.sin(azimuth_rad), math.cos(azimuth_rad)
+
+
 def _index_properties(
     index: WaveExposureIndexRow,
 ) -> dict:
@@ -64,10 +78,12 @@ def _index_properties(
 def _point_properties(
     point: WavePointRow,
 ) -> dict:
+    normal_x, normal_y = _normal_components(point.normal_azimuth_deg)
+
     return {
         "point_id":           int(point.id),
-        "normal_x":           _f(point.normal_x),
-        "normal_y":           _f(point.normal_y),
+        "normal_x":           _f(normal_x),
+        "normal_y":           _f(normal_y),
         "normal_azimuth_deg": _f(point.normal_azimuth_deg),
     }
 

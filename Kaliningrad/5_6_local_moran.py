@@ -17,8 +17,8 @@ MODE = "export"
 INDEX_DB = DATA_DIR / "db" / "wave_activity_indices.db"
 COASTLINE_GEOJSON = DATA_DIR / "coastline" / "T_kaliningrad_merged.geojson"
 
-RADIUS_M = 2500.0
-WINDOW_WIDTH_M = 6000.0
+RADIUS_M = 5000.0
+WINDOW_WIDTH_M = 11000.0
 
 ALONGSHORE_MODE = "abs"
 METRIC_CRS: str | None = None
@@ -56,7 +56,8 @@ def main() -> None:
         ),
     )
 
-    from src.waves.local_moran import LocalMoranService, export_local_moran_geojson
+    from src.waves.local_moran.service import LocalMoranService
+    from src.waves.local_moran.export import export_local_moran_geojson
 
     mode = str(MODE).strip().lower()
 

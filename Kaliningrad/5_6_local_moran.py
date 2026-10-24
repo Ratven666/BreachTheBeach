@@ -17,8 +17,8 @@ MODE = "export"
 INDEX_DB = DATA_DIR / "db" / "wave_activity_indices.db"
 COASTLINE_GEOJSON = DATA_DIR / "coastline" / "T_kaliningrad_merged.geojson"
 
-RADIUS_M = 5000.0
-WINDOW_WIDTH_M = 11000.0
+RADIUS_M = 10000.0
+WINDOW_WIDTH_M = 30000.0
 
 ALONGSHORE_MODE = "abs"
 METRIC_CRS: str | None = None
@@ -32,11 +32,11 @@ RANDOM_SEED = 42
 
 # Порог по raw pseudo p-value для поля cluster
 # ALPHA_RAW = 0.10
-ALPHA_RAW = 0.99
+ALPHA_RAW = 0.999
 
 # Порог по FDR-corrected q-value для поля cluster_fdr
 # ALPHA_FDR = 0.10
-ALPHA_FDR = 0.99
+ALPHA_FDR = 0.999
 
 EXPORT_RUN_ID: int | None = None
 OUTPUT_GEOJSON = DATA_DIR / "wave" / "local_moran.geojson"

@@ -42,7 +42,8 @@ COASTLINE_MAIN_PATH: Path | None = PROJECT_ROOT / "Kaliningrad" / "data" / "coas
 
 NORMALS_NAME = "kaliningrad_coastline_step200m_right"
 SEA_SIDE = "right"
-TANGENT_DELTA_M = 20.0
+# TANGENT_DELTA_M = 20.0
+TANGENT_DELTA_M = 10.0
 MAX_REFERENCE_DISTANCE_M: float | None = 50.0
 # ─────────────────────────────────────────────────────────────────────
 

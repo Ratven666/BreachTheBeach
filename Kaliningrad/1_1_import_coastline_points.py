@@ -31,7 +31,7 @@ COASTLINE_MAIN_PATH = Path(
 COASTLINE_OTHER_PATH: Path | None = None
 
 DATASET_NAME = "KaliningradOSM"
-STRATEGY_STEP_M = 200.0
+STRATEGY_STEP_M = 50.0
 INPUT_CRS = "EPSG:4326"
 DATABASE_POINT_CRS = "EPSG:4326"
 # ─────────────────────────────────────────────────────────────────────

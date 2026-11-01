@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import fcntl
+import json
+import math
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
@@ -13,170 +17,410 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 DATA_DIR = PROJECT_ROOT / "Kaliningrad" / "data"
 
-WEATHER_DB = Path(os.getenv("WAVE_WEATHER_DB", DATA_DIR / "db" / "weather_compact.db"))
-COASTLINE_DB = Path(os.getenv("WAVE_COASTLINE_DB", DATA_DIR / "db" / "coastline.db"))
-BATHY_MANIFEST = Path(os.getenv("WAVE_BATHY_MANIFEST", DATA_DIR / "bathymetry" / "manifest.json"))
-OUTPUT_DB = Path(os.getenv("WAVE_OUTPUT_DB", DATA_DIR / "db" / "wave_activity.db"))
 
-NORMAL_SOURCE_ID = (
-    int(os.environ["WAVE_NORMAL_SOURCE_ID"])
-    if os.getenv("WAVE_NORMAL_SOURCE_ID")
-    else None
-)
-START_DATE = os.getenv("WAVE_START_DATE") or None
-END_DATE = os.getenv("WAVE_END_DATE") or None
-OVERWATER_FACTOR = float(os.getenv("WAVE_OVERWATER_FACTOR", "1.1"))
-BREAKING_COEFF = float(os.getenv("WAVE_BREAKING_COEFF", "0.55"))
-RHO_WATER = float(os.getenv("WAVE_RHO_WATER", "1025.0"))
-GRAVITY = float(os.getenv("WAVE_GRAVITY", "9.81"))
-BATHY_STEPS = int(os.getenv("WAVE_BATHY_STEPS", "1000"))
-COMMIT_BATCH_SIZE = int(os.getenv("WAVE_COMMIT_BATCH_SIZE", "500"))
-# WAVE_MAX_WORKERS=0 → автоматически (cpu_count - 1).
-MAX_WORKERS_RAW = int(os.getenv("WAVE_MAX_WORKERS", "10"))
-OVERWRITE = os.getenv("WAVE_OVERWRITE", "false").lower() in {"1", "true", "yes", "on"}
-LOG_LEVEL = os.getenv("WAVE_LOG_LEVEL", "INFO")
+def env_path(
+    name: str,
+    default: Path,
+) -> Path:
+    return (
+        Path(os.getenv(name, str(default)))
+        .expanduser()
+        .resolve()
+    )
 
 
-def _parse_date(value: str | None, name: str) -> date | None:
+def env_date(
+    name: str,
+) -> date | None:
+    value = os.getenv(name)
+
     if not value:
         return None
+
     try:
         return date.fromisoformat(value)
     except ValueError as exc:
-        raise ValueError(f"{name} must be in ISO format YYYY-MM-DD, got {value!r}") from exc
+        raise ValueError(
+            f"{name}: expected YYYY-MM-DD, got {value!r}"
+        ) from exc
 
 
-def _resolve_max_workers(value: int) -> int | None:
-    if value < 0:
-        raise ValueError(f"WAVE_MAX_WORKERS must be >= 0, got {value}")
-    return value or None
+def positive_int(
+    name: str,
+    default: int,
+    minimum: int = 1,
+) -> int:
+    value = int(os.getenv(name, str(default)))
+
+    if value < minimum:
+        raise ValueError(
+            f"{name} must be >= {minimum}"
+        )
+
+    return value
 
 
-def _remove_sqlite_files(path: Path) -> None:
-    for p in (path, Path(f"{path}-wal"), Path(f"{path}-shm"), Path(f"{path}-journal")):
-        if p.exists():
-            p.unlink()
+def positive_float(
+    name: str,
+    default: float,
+) -> float:
+    value = float(os.getenv(name, str(default)))
+
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{name} must be finite and > 0"
+        )
+
+    return value
 
 
-def configure_logging() -> None:
-    logger.remove()
-    logger.add(
-        sys.stderr,
-        level=LOG_LEVEL,
-        colorize=True,
-        format=(
-            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-            "<level>{level: <8}</level> | "
-            "<level>{message}</level>"
-        ),
-    )
+@contextmanager
+def output_lock(
+    path: Path,
+):
+    # macOS/Linux.
+    #
+    # Файл блокировки намеренно не удаляется:
+    # блокировку снимает ОС при завершении процесса.
+    with Path(f"{path}.lock").open("a+") as handle:
+        try:
+            fcntl.flock(
+                handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"Another wave calculation owns {path}"
+            ) from exc
+
+        try:
+            yield
+        finally:
+            fcntl.flock(
+                handle.fileno(),
+                fcntl.LOCK_UN,
+            )
 
 
 def main() -> None:
-    configure_logging()
+    logger.remove()
 
-    start_date = _parse_date(START_DATE, "WAVE_START_DATE")
-    end_date = _parse_date(END_DATE, "WAVE_END_DATE")
-    if start_date is not None and end_date is not None and start_date > end_date:
+    logger.add(
+        sys.stderr,
+        level=os.getenv("WAVE_LOG_LEVEL", "INFO"),
+    )
+
+    weather = env_path(
+        "WAVE_WEATHER_DB",
+        DATA_DIR / "db/weather_compact.db",
+    )
+
+    coastline = env_path(
+        "WAVE_COASTLINE_DB",
+        DATA_DIR / "db/coastline.db",
+    )
+
+    manifest = env_path(
+        "WAVE_BATHY_MANIFEST",
+        DATA_DIR / "bathymetry/manifest.json",
+    )
+
+    output = env_path(
+        "WAVE_OUTPUT_DB",
+        DATA_DIR / "db/wave_activity.db",
+    )
+
+    start = env_date("WAVE_START_DATE")
+    end = env_date("WAVE_END_DATE")
+
+    if (
+        start is not None
+        and end is not None
+        and start > end
+    ):
         raise ValueError(
-            f"WAVE_START_DATE ({start_date}) is later than WAVE_END_DATE ({end_date})"
+            "WAVE_START_DATE is later than WAVE_END_DATE"
         )
 
-    max_workers = _resolve_max_workers(MAX_WORKERS_RAW)
+    max_workers = positive_int(
+        "WAVE_MAX_WORKERS",
+        4,
+        minimum=0,
+    )
 
-    for path, label in (
-        (WEATHER_DB, "weather archive"),
-        (COASTLINE_DB, "coastline database"),
-        (BATHY_MANIFEST, "bathymetry manifest"),
+    max_workers = max_workers or max(
+        1,
+        (os.cpu_count() or 1) - 1,
+    )
+
+    pool_points = positive_int(
+        "WAVE_POOL_BATCH_POINTS",
+        128,
+    )
+
+    commit_rows = positive_int(
+        "WAVE_COMMIT_BATCH_SIZE",
+        500,
+    )
+
+    commit_points = positive_int(
+        "WAVE_COMMIT_POINTS",
+        4,
+    )
+
+    commit_seconds = positive_float(
+        "WAVE_COMMIT_SECONDS",
+        10.0,
+    )
+
+    breaking = positive_float(
+        "WAVE_BREAKING_COEFF",
+        0.55,
+    )
+
+    if breaking > 1:
+        raise ValueError(
+            "WAVE_BREAKING_COEFF must be <= 1"
+        )
+
+    options = {
+        "start_date": (
+            start.isoformat()
+            if start
+            else None
+        ),
+        "end_date": (
+            end.isoformat()
+            if end
+            else None
+        ),
+        "bathy_manifest_path": str(manifest),
+        "bathy_n_steps": positive_int(
+            "WAVE_BATHY_STEPS",
+            1000,
+            minimum=2,
+        ),
+        "overwater_factor": positive_float(
+            "WAVE_OVERWATER_FACTOR",
+            1.1,
+        ),
+        "breaking_coeff": breaking,
+        "rho_water": positive_float(
+            "WAVE_RHO_WATER",
+            1025.0,
+        ),
+        "g": positive_float(
+            "WAVE_GRAVITY",
+            9.81,
+        ),
+    }
+
+    overwrite = (
+        os.getenv("WAVE_OVERWRITE", "false").lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+    raw_source = os.getenv(
+        "WAVE_NORMAL_SOURCE_ID"
+    )
+
+    source_id = (
+        int(raw_source)
+        if raw_source
+        else None
+    )
+
+    for path in (
+        weather,
+        coastline,
+        manifest,
     ):
         if not path.is_file():
-            raise FileNotFoundError(f"Missing {label}: {path.resolve()}")
+            raise FileNotFoundError(path)
 
-    output = OUTPUT_DB.expanduser().resolve()
-    if output.exists() and not OVERWRITE:
-        raise FileExistsError(
-            f"Output DB already exists: {output}. Set WAVE_OVERWRITE=true to replace."
+    content = json.loads(
+        manifest.read_text(encoding="utf-8")
+    )
+
+    tiles = [
+        (manifest.parent / tile["file"]).resolve()
+        for tile in content["tiles"]
+    ]
+
+    inputs = [
+        weather,
+        coastline,
+        manifest,
+        *tiles,
+    ]
+
+    if output in inputs:
+        raise ValueError(
+            "WAVE_OUTPUT_DB must not overwrite an input file"
         )
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f"{output.name}.tmp")
-    _remove_sqlite_files(temporary)
+    # Входные архивы должны быть неизменяемыми во время расчёта.
+    # Нельзя игнорировать данные, оставшиеся в их WAL.
+    for db in (
+        weather,
+        coastline,
+    ):
+        wal = Path(f"{db}-wal")
+
+        if wal.exists() and wal.stat().st_size:
+            raise RuntimeError(
+                "Checkpoint/close the input SQLite WAL first: "
+                f"{wal}"
+            )
 
     os.environ["COASTLINE_DATABASE_URL"] = (
-        f"sqlite:///{COASTLINE_DB.expanduser().resolve().as_posix()}"
+        f"sqlite:///{coastline.as_posix()}"
     )
+
+    # Устанавливается до импорта NumPy/SciPy.
+    # Не даём каждому worker создавать собственный
+    # многопоточный BLAS-пул.
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[name] = "1"
+
+    from sqlalchemy import select
 
     from src.bathymetry.archive import BathymetryArchive
     from src.coastline.storage.db import SessionLocal
-    from src.weather_history.archive import CompactWeatherRepository
+    from src.coastline.storage.models import (
+        CoastlineNormalSourceModel,
+    )
     from src.waves.services.wave_activity_db_service import (
-        WaveActivityDatabaseBuilder,
+        load_wave_points,
         resolve_normal_source_id,
     )
-    from src.waves.storage import WaveActivityRepository
-
-    logger.info("Weather archive:     {}", WEATHER_DB.resolve())
-    logger.info("Coastline database:  {}", COASTLINE_DB.resolve())
-    logger.info("Bathymetry manifest: {}", BATHY_MANIFEST.resolve())
-    logger.info("Output database:     {}", output)
-    logger.info(
-        "Parameters: period={}..{}, overwater_factor={}, breaking_coeff={}, "
-        "rho_water={}, g={}, bathy_steps={}, max_workers={}",
-        start_date or "begin", end_date or "end",
-        OVERWATER_FACTOR, BREAKING_COEFF, RHO_WATER, GRAVITY, BATHY_STEPS,
-        max_workers or "auto",
+    from src.waves.services.resumable_wave_activity import (
+        ALGORITHM_VERSION,
+        CheckpointRepository,
+        input_signature,
+        run_incremental,
     )
 
-    try:
-        with SessionLocal() as coastline_session:
-            normal_source_id = resolve_normal_source_id(coastline_session, NORMAL_SOURCE_ID)
-            logger.info("Selected normal_source_id={}", normal_source_id)
+    output.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-            bathymetry = BathymetryArchive(BATHY_MANIFEST)
-
-            with CompactWeatherRepository(WEATHER_DB) as weather_repo:
-                with WaveActivityRepository(temporary) as output_repo:
-                    stats = WaveActivityDatabaseBuilder(
-                        coastline_session=coastline_session,
-                        weather_repository=weather_repo,
-                        bathymetry_archive=bathymetry,
-                        output_repository=output_repo,
-                        normal_source_id=normal_source_id,
-                        start_date=start_date,
-                        end_date=end_date,
-                        overwater_factor=OVERWATER_FACTOR,
-                        breaking_coeff=BREAKING_COEFF,
-                        rho_water=RHO_WATER,
-                        g=GRAVITY,
-                        bathy_n_steps=BATHY_STEPS,
-                        commit_batch_size=COMMIT_BATCH_SIZE,
-                        max_workers=max_workers,
-                    ).run()
-
-        if output.exists():
-            _remove_sqlite_files(output)
-        os.replace(temporary, output)
-
-    except Exception:
-        _remove_sqlite_files(temporary)
-        logger.exception("Wave activity calculation failed")
-        raise
-
-    if stats.error_point_count > 0:
-        logger.warning(
-            "{} of {} points failed during calculation and have empty summaries",
-            stats.error_point_count, stats.point_count,
+    with output_lock(output):
+        # SHA-256 входных архивов и исходного кода.
+        #
+        # Параметры производительности — число workers,
+        # размеры пачек — в fingerprint не входят.
+        # Их можно менять при продолжении расчёта.
+        code = sorted(
+            (PROJECT_ROOT / "src").rglob("*.py")
         )
 
-    logger.success(
-        "Completed: points={}, processed_days={}, active_rows={}, "
-        "skipped_weather={}, land_sector_days={}, missing_bathymetry_days={}, "
-        "calc_errors={}, db={}",
-        stats.point_count, stats.processed_day_count, stats.activity_count,
-        stats.skipped_weather_rows, stats.land_sector_rows,
-        stats.missing_bathymetry_rows, stats.error_point_count, output,
-    )
-    logger.info("Next: python db_pypeline/5_2_wave_exposure_to_db.py")
+        code += [
+            Path(__file__).resolve(),
+            PROJECT_ROOT / "poetry.lock",
+        ]
+
+        signature, states = input_signature(
+            inputs + code
+        )
+
+        with SessionLocal() as session:
+            source_id = resolve_normal_source_id(
+                session,
+                source_id,
+            )
+
+            points = load_wave_points(
+                session,
+                source_id,
+            )
+
+            if not points:
+                raise ValueError(
+                    "No coastline points found"
+                )
+
+            point_source = session.execute(
+                select(
+                    CoastlineNormalSourceModel.point_source_id
+                )
+                .where(
+                    CoastlineNormalSourceModel.id
+                    == source_id
+                )
+            ).scalar_one()
+
+            archive = BathymetryArchive(
+                manifest
+            )
+
+            if archive.point_source_id != point_source:
+                raise ValueError(
+                    "Bathymetry and normals refer "
+                    "to different point sources"
+                )
+
+        config = {
+            "algorithm_version": ALGORITHM_VERSION,
+            "normal_source_id": source_id,
+            "point_count": len(points),
+            "options": options,
+            "inputs": signature,
+        }
+
+        with CheckpointRepository(output) as repository:
+            pending = repository.setup(
+                config,
+                points,
+                overwrite=overwrite,
+            )
+
+            logger.info(
+                "points={}, saved={}, pending={}, "
+                "workers={}, database={}",
+                len(points),
+                len(points) - len(pending),
+                len(pending),
+                max_workers,
+                output,
+            )
+
+            stats = run_incremental(
+                repository,
+                pending,
+                weather_path=weather,
+                coastline_path=coastline,
+                options=options,
+                input_states=states,
+                max_workers=max_workers,
+                pool_batch_points=pool_points,
+                commit_batch_size=commit_rows,
+                commit_points=commit_points,
+                commit_seconds=commit_seconds,
+            )
+
+        logger.info(
+            "Saved stats: {}",
+            stats,
+        )
+
+        if stats.error_point_count:
+            raise SystemExit(
+                "Some points failed. Fix the cause "
+                "and restart WITHOUT WAVE_OVERWRITE."
+            )
+
+        logger.success(
+            "Completed: {}",
+            output,
+        )
 
 
 if __name__ == "__main__":

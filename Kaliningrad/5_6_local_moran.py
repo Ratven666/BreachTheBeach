@@ -17,8 +17,8 @@ MODE = "export"
 INDEX_DB = DATA_DIR / "db" / "wave_activity_indices.db"
 COASTLINE_GEOJSON = DATA_DIR / "coastline" / "T_kaliningrad_merged.geojson"
 
-RADIUS_M = 10000.0
-WINDOW_WIDTH_M = 30000.0
+RADIUS_M = 1000.0
+WINDOW_WIDTH_M = 3000.0
 
 ALONGSHORE_MODE = "abs"
 METRIC_CRS: str | None = None

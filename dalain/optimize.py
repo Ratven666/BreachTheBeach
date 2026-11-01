@@ -1,6 +1,7 @@
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -18,11 +19,17 @@ from shapely.geometry import (
     mapping,
 )
 
+from .anchored import (
+    AnchoredGeometry,
+    GeneticBuilder,
+    LOCAL_MUTATION_FRACTION,
+    LOCAL_MUTATION_MAX_CELLS,
+    LOCAL_MUTATION_ATTEMPTS,
+)
+
 from .geometry import (
     InvalidScenarioError,
     geometry_parts,
-    is_connected,
-    neighbours,
 )
 
 from .logging_utils import (
@@ -53,6 +60,35 @@ def mean_normal_cwef(result, baseline):
     return result.mean_cwef
 
 
+def shape_id(cells):
+    encoded = json.dumps(
+        sorted(cells),
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return hashlib.sha256(
+        encoded
+    ).hexdigest()[:20]
+
+
+def write_json(path, content):
+    temporary = path.with_suffix(
+        path.suffix + ".tmp"
+    )
+
+    temporary.write_text(
+        json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    temporary.replace(path)
+
+
 class Evaluator:
     def __init__(self, cfg, geometry):
         from .physics import LRU, Physics
@@ -76,7 +112,7 @@ class Evaluator:
 
     def calculate(self, cells, label):
         with stage(
-            f"{label}: береговая линия и нормали"
+            f"{label}: берег и нормали"
         ):
             scenario = self.geometry.scenario(
                 cells
@@ -93,15 +129,14 @@ class Evaluator:
             len(scenario.sites),
         )
 
+        metrics = []
+
         progress = Progress(
             f"{label}: CWEF",
             len(scenario.sites),
             self.cfg.progress_interval_s,
             self.cfg.point_log_every,
         )
-
-        # Отдельный список для текущего решения.
-        metrics = []
 
         for index, site in enumerate(
             scenario.sites,
@@ -158,320 +193,6 @@ class Evaluator:
             )
 
 
-class GeneticBuilder:
-    def __init__(self, cfg, geometry, rng):
-        self.cfg = cfg
-        self.geometry = geometry
-        self.rng = rng
-
-        self.center_water = {}
-
-    def _simple_add(self, cell, cells):
-        """Консервативная локальная защита от замыкания воды.
-
-        Полная геометрическая проверка всё равно
-        выполняется после построения кандидата.
-        """
-        i, j = cell
-
-        ring = {
-            (i + dx, j + dy)
-            for dx in (-1, 0, 1)
-            for dy in (-1, 0, 1)
-            if dx or dy
-        }
-
-        free = set()
-        side = self.cfg.cell_side_m
-
-        for other in ring:
-            if other in cells:
-                continue
-
-            if other not in self.center_water:
-                self.center_water[other] = (
-                    not self.geometry.local_land.covers(
-                        Point(
-                            other[0] * side,
-                            other[1] * side,
-                        )
-                    )
-                )
-
-            if self.center_water[other]:
-                free.add(other)
-
-        if not free:
-            return True
-
-        visited = set()
-        pending = [min(free)]
-
-        while pending:
-            current = pending.pop()
-
-            if current in visited:
-                continue
-
-            visited.add(current)
-
-            pending.extend(
-                other
-                for other in neighbours(current)
-                if other in free
-                and other not in visited
-            )
-
-        return len(visited) == len(free)
-
-    def trim(self, source, retained):
-        cells = set(source)
-
-        while len(cells) > retained:
-            candidates = [
-                cell
-                for cell in sorted(cells)
-                if any(
-                    other not in cells
-                    for other in neighbours(cell)
-                )
-            ]
-
-            self.rng.shuffle(
-                candidates
-            )
-
-            for cell in candidates:
-                reduced = cells - {cell}
-
-                if (
-                    not reduced
-                    or not is_connected(reduced)
-                ):
-                    continue
-
-                if self.cfg.connection == "attached":
-                    if not any(
-                        self.geometry.units[other] == 1
-                        for other in reduced
-                    ):
-                        continue
-
-                cells = reduced
-                break
-
-            else:
-                break
-
-        return frozenset(cells)
-
-    def build(
-        self,
-        preferred=frozenset(),
-        core=frozenset(),
-    ):
-        geometry = self.geometry
-
-        for attempt in range(
-            self.cfg.construction_attempts
-        ):
-            if attempt == 0 and core:
-                cells = set(core)
-
-            else:
-                inherited = [
-                    cell
-                    for cell in geometry.seeds
-                    if cell in preferred
-                ]
-
-                pool = (
-                    inherited
-                    if inherited
-                    and self.rng.random() < 0.8
-                    else geometry.seeds
-                )
-
-                cells = {
-                    self.rng.choice(pool)
-                }
-
-            units = sum(
-                geometry.units[cell]
-                for cell in cells
-            )
-
-            if units > self.cfg.target_units:
-                continue
-
-            center_i = (
-                sum(cell[0] for cell in cells)
-                / len(cells)
-            )
-            center_j = (
-                sum(cell[1] for cell in cells)
-                / len(cells)
-            )
-
-            frontier = {
-                other
-                for cell in cells
-                for other in neighbours(cell)
-                if other in geometry.cells
-                and other not in cells
-            }
-
-            while units < self.cfg.target_units:
-                remaining = (
-                    self.cfg.target_units
-                    - units
-                )
-
-                available = [
-                    cell
-                    for cell in sorted(frontier)
-                    if (
-                        geometry.units[cell]
-                        <= remaining
-                    )
-                ]
-
-                def priority(cell):
-                    shared = sum(
-                        other in cells
-                        for other in neighbours(cell)
-                    )
-
-                    radial = (
-                        (cell[0] - center_i)**2
-                        + (cell[1] - center_j)**2
-                    ) / max(
-                        1,
-                        self.cfg.target_units / 2,
-                    )
-
-                    inherited_bonus = (
-                        0.8 if cell in preferred else 0.0
-                    )
-
-                    return (
-                        radial
-                        - 0.3 * shared
-                        - inherited_bonus
-                        + self.rng.random() * 0.7
-                    )
-
-                available.sort(
-                    key=priority
-                )
-
-                cell = next(
-                    (
-                        candidate
-                        for candidate in available
-                        if self._simple_add(
-                            candidate,
-                            cells,
-                        )
-                    ),
-                    None,
-                )
-
-                if cell is None:
-                    break
-
-                cells.add(cell)
-                units += geometry.units[cell]
-
-                frontier.discard(cell)
-
-                frontier.update(
-                    other
-                    for other in neighbours(cell)
-                    if other in geometry.cells
-                    and other not in cells
-                )
-
-            candidate = frozenset(cells)
-
-            if geometry.valid(candidate):
-                logger.debug(
-                    "Кандидат без озёр построен "
-                    "за {} попыток | квадратов={}",
-                    attempt + 1,
-                    len(candidate),
-                )
-
-                return candidate
-
-        raise RuntimeError(
-            "Не удалось построить связный намыв "
-            "точной площади без замкнутых водных полостей. "
-            "Проверьте площадь, размер квадрата и радиус."
-        )
-
-    def child(self, first, second):
-        result = first
-
-        if (
-            self.rng.random()
-            < self.cfg.crossover_probability
-        ):
-            result = self.build(
-                first | second,
-                self.trim(
-                    first,
-                    max(1, len(first) // 2),
-                ),
-            )
-
-        if (
-            self.rng.random()
-            < self.cfg.mutation_probability
-        ):
-            dx, dy = self.rng.choice(
-                (
-                    (-1, 0),
-                    (1, 0),
-                    (0, -1),
-                    (0, 1),
-                )
-            )
-
-            shifted = frozenset(
-                (i + dx, j + dy)
-                for i, j in result
-            )
-
-            if (
-                self.rng.random() < 0.35
-                and self.geometry.valid(shifted)
-            ):
-                return shifted
-
-            retained = max(
-                1,
-                len(result)
-                - max(
-                    1,
-                    math.ceil(
-                        len(result)
-                        * self.cfg.mutation_fraction
-                    ),
-                ),
-            )
-
-            result = self.build(
-                result,
-                self.trim(
-                    result,
-                    retained,
-                ),
-            )
-
-        return result
-
-
 class Recorder:
     def __init__(
         self,
@@ -487,6 +208,7 @@ class Recorder:
 
         self.sequence = 0
         self.frame_count = 0
+        self.accepted_count = 0
         self.rejected_count = 0
 
         for name in (
@@ -496,7 +218,7 @@ class Recorder:
         ):
             (directory / name).mkdir()
 
-        self.handle = (
+        self.history_handle = (
             directory / "history.csv"
         ).open(
             "w",
@@ -504,93 +226,59 @@ class Recorder:
             newline="",
         )
 
+        self.accepted_handle = (
+            directory / "accepted.csv"
+        ).open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        )
+
         self.columns = [
-            "sequence",
+            "solution_id",
+            "parent_solution_id",
+            "shape_id",
             "epoch",
             "generation",
             "individual",
             "score",
             "mean_CWEF_Wm",
             "area_m2",
-            "actual_water_area_m2",
             "cell_count",
             "point_count",
-            "original_point_count",
-            "reclamation_point_count",
-            "coast_length_m",
+            "removed_cell_count",
+            "added_cell_count",
+            "anchor_inside",
             "cached",
             "file",
         ]
 
-        self.writer = csv.DictWriter(
-            self.handle,
+        self.history_writer = csv.DictWriter(
+            self.history_handle,
             fieldnames=self.columns,
         )
+        self.history_writer.writeheader()
 
-        self.writer.writeheader()
+        self.accepted_writer = csv.DictWriter(
+            self.accepted_handle,
+            fieldnames=[
+                "accepted_step",
+                "solution_id",
+                "parent_solution_id",
+                "epoch",
+                "generation",
+                "score",
+                "mean_CWEF_Wm",
+                "removed_cell_count",
+                "added_cell_count",
+                "file",
+            ],
+        )
+        self.accepted_writer.writeheader()
 
     def close(self):
-        self.handle.close()
-
-    def reject(
-        self,
-        cells,
-        reason,
-        epoch,
-        generation,
-        individual,
-    ):
-        features = []
-
-        for cell in sorted(cells):
-            if cell not in self.geometry.cells:
-                continue
-
-            features.append({
-                "type": "Feature",
-                "geometry": mapping(
-                    self.geometry.wgs84(
-                        self.geometry.cells[cell]
-                    )
-                ),
-                "properties": {
-                    "kind": "rejected_cell",
-                    "i": cell[0],
-                    "j": cell[1],
-                },
-            })
-
-        path = (
-            self.directory
-            / "rejected"
-            / f"rejected_{self.rejected_count:08d}.geojson"
-        )
-
-        path.write_text(
-            json.dumps(
-                {
-                    "type": "FeatureCollection",
-                    "metadata": {
-                        "epoch": epoch,
-                        "generation": generation,
-                        "individual": individual,
-                        "reason": str(reason),
-                    },
-                    "features": features,
-                },
-                ensure_ascii=False,
-                allow_nan=False,
-            ),
-            encoding="utf-8",
-        )
-
-        self.rejected_count += 1
-
-        logger.warning(
-            "Кандидат отклонён: {} | {}",
-            reason,
-            path.name,
-        )
+        self.history_handle.close()
+        self.accepted_handle.close()
 
     def save(
         self,
@@ -599,16 +287,43 @@ class Recorder:
         epoch,
         generation,
         individual,
+        parent_cells=None,
+        parent_solution_id=None,
         cached=False,
     ):
         scenario = result.scenario
-        features = []
+
+        solution_id = (
+            f"solution_{self.sequence:08d}"
+        )
+
+        if parent_cells is None:
+            removed = frozenset()
+            added = frozenset()
+        else:
+            removed = (
+                parent_cells - scenario.cells
+            )
+            added = (
+                scenario.cells - parent_cells
+            )
+
+        anchor_inside = bool(
+            scenario.cells
+            and scenario.fill.contains(
+                self.geometry.anchor_point
+            )
+        )
 
         context = {
+            "solution_id": solution_id,
+            "parent_solution_id": parent_solution_id,
             "epoch": epoch,
             "generation": generation,
             "individual": individual,
         }
+
+        features = []
 
         def add(geometry, properties):
             if geometry.is_empty:
@@ -625,6 +340,14 @@ class Recorder:
                 },
             })
 
+        add(
+            self.geometry.anchor_point,
+            {
+                "kind": "anchor",
+                "inside_reclamation": anchor_inside,
+            },
+        )
+
         for cell in sorted(scenario.cells):
             add(
                 self.geometry.cells[cell],
@@ -632,9 +355,13 @@ class Recorder:
                     "kind": "cell",
                     "i": cell[0],
                     "j": cell[1],
+                    "is_anchor_cell": (
+                        cell == self.geometry.anchor_cell
+                    ),
                     "area_units": (
                         self.geometry.units[cell]
                     ),
+                    "is_added": cell in added,
                 },
             )
 
@@ -686,8 +413,10 @@ class Recorder:
             )
 
         metadata = {
-            "sequence": self.sequence,
             **context,
+            "shape_id": shape_id(
+                scenario.cells
+            ),
             "objective": self.objective,
             "score": float(score),
             "mean_CWEF_Wm": result.mean_cwef,
@@ -706,33 +435,29 @@ class Recorder:
             "coast_length_m": (
                 scenario.coast.length
             ),
+            "removed_cell_count": len(removed),
+            "added_cell_count": len(added),
+            "anchor_inside": anchor_inside,
+            "is_accepted": False,
             "cached": bool(cached),
         }
 
         path = (
             self.directory
             / "solutions"
-            / f"solution_{self.sequence:08d}.geojson"
+            / f"{solution_id}.geojson"
         )
 
-        temporary = path.with_suffix(".tmp")
-
-        temporary.write_text(
-            json.dumps(
-                {
-                    "type": "FeatureCollection",
-                    "metadata": metadata,
-                    "features": features,
-                },
-                ensure_ascii=False,
-                allow_nan=False,
-            ),
-            encoding="utf-8",
+        write_json(
+            path,
+            {
+                "type": "FeatureCollection",
+                "metadata": metadata,
+                "features": features,
+            },
         )
 
-        temporary.replace(path)
-
-        self.writer.writerow({
+        self.history_writer.writerow({
             **{
                 key: metadata[key]
                 for key in self.columns
@@ -741,14 +466,114 @@ class Recorder:
             "file": path.name,
         })
 
-        self.handle.flush()
+        self.history_handle.flush()
         self.sequence += 1
 
-        return path
+        return path, solution_id
+
+    def accept(self, path):
+        content = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        metadata = content["metadata"]
+        metadata["is_accepted"] = True
+        metadata["accepted_step"] = (
+            self.accepted_count
+        )
+
+        write_json(
+            path,
+            content,
+        )
+
+        shutil.copyfile(
+            path,
+            self.directory / "best.geojson",
+        )
+
+        self.accepted_writer.writerow({
+            "accepted_step": self.accepted_count,
+            "solution_id": metadata["solution_id"],
+            "parent_solution_id": (
+                metadata["parent_solution_id"]
+            ),
+            "epoch": metadata["epoch"],
+            "generation": metadata["generation"],
+            "score": metadata["score"],
+            "mean_CWEF_Wm": metadata["mean_CWEF_Wm"],
+            "removed_cell_count": (
+                metadata["removed_cell_count"]
+            ),
+            "added_cell_count": (
+                metadata["added_cell_count"]
+            ),
+            "file": path.name,
+        })
+
+        self.accepted_handle.flush()
+        self.accepted_count += 1
+
+    def reject(
+        self,
+        cells,
+        reason,
+        epoch,
+        generation,
+        individual,
+    ):
+        features = []
+
+        for cell in sorted(cells):
+            if cell not in self.geometry.cells:
+                continue
+
+            features.append({
+                "type": "Feature",
+                "geometry": mapping(
+                    self.geometry.wgs84(
+                        self.geometry.cells[cell]
+                    )
+                ),
+                "properties": {
+                    "kind": "rejected_cell",
+                    "i": cell[0],
+                    "j": cell[1],
+                },
+            })
+
+        path = (
+            self.directory
+            / "rejected"
+            / f"rejected_{self.rejected_count:08d}.geojson"
+        )
+
+        write_json(
+            path,
+            {
+                "type": "FeatureCollection",
+                "metadata": {
+                    "epoch": epoch,
+                    "generation": generation,
+                    "individual": individual,
+                    "reason": str(reason),
+                },
+                "features": features,
+            },
+        )
+
+        self.rejected_count += 1
+
+        logger.warning(
+            "Кандидат отклонён | {} | {}",
+            reason,
+            path.name,
+        )
 
     def frame(
         self,
-        population,
         result,
         epoch,
         generation,
@@ -797,17 +622,7 @@ class Recorder:
                 linewidth=0.7,
             )
 
-        # Показываются только ячейки текущей популяции.
-        for cells in population:
-            for cell in sorted(cells):
-                axis.fill(
-                    *self.geometry.cells[
-                        cell
-                    ].exterior.xy,
-                    color="#597ea6",
-                    alpha=0.04,
-                )
-
+        # На основной анимации только принятое решение.
         for cell in sorted(scenario.cells):
             axis.fill(
                 *self.geometry.cells[
@@ -815,7 +630,7 @@ class Recorder:
                 ].exterior.xy,
                 facecolor="#ed974c",
                 edgecolor="white",
-                linewidth=0.5,
+                linewidth=0.4,
             )
 
         for line in geometry_parts(
@@ -828,7 +643,6 @@ class Recorder:
                 linewidth=0.8,
             )
 
-        # Только точки текущего результата.
         scatter = axis.scatter(
             [
                 site.x
@@ -848,35 +662,6 @@ class Recorder:
             vmax=max(1, color_max),
         )
 
-        length = min(
-            self.cfg.cell_side_m,
-            self.cfg.point_spacing_m * 0.3,
-        )
-
-        axis.quiver(
-            [
-                site.x
-                for site in scenario.sites
-            ],
-            [
-                site.y
-                for site in scenario.sites
-            ],
-            [
-                site.nx * length
-                for site in scenario.sites
-            ],
-            [
-                site.ny * length
-                for site in scenario.sites
-            ],
-            angles="xy",
-            scale_units="xy",
-            scale=1,
-            width=0.002,
-            alpha=0.5,
-        )
-
         figure.colorbar(
             scatter,
             ax=axis,
@@ -892,8 +677,10 @@ class Recorder:
         )
 
         axis.plot(
-            0, 0, "+",
+            0, 0,
+            marker="*",
             color="red",
+            markersize=10,
         )
 
         axis.set_xlim(-radius, radius)
@@ -902,11 +689,20 @@ class Recorder:
         axis.set_xlabel("Local east, m")
         axis.set_ylabel("Local north, m")
 
+        label = (
+            "Initial anchored solution"
+            if generation < 0
+            else (
+                f"Epoch {epoch + 1}/{self.cfg.epochs}, "
+                f"generation {generation + 1}/"
+                f"{self.cfg.generations}"
+            )
+        )
+
         axis.set_title(
-            f"Epoch {epoch + 1}/{self.cfg.epochs}, "
-            f"generation {generation + 1}/{self.cfg.generations}\n"
-            f"Mean normal CWEF = {result.mean_cwef:.6g} W/m; "
-            f"points = {len(scenario.sites)}"
+            f"{label}\n"
+            f"Accepted mean normal CWEF = "
+            f"{result.mean_cwef:.6g} W/m"
         )
 
         curve = figure.add_axes(
@@ -919,9 +715,9 @@ class Recorder:
         )
 
         curve.set_xlabel(
-            "Generation frames across all epochs"
+            "Initial solution and generation frames"
         )
-        curve.set_ylabel("Global best")
+        curve.set_ylabel("Accepted objective")
         curve.grid(alpha=0.25)
 
         figure.savefig(
@@ -958,7 +754,7 @@ class Recorder:
                     or index == len(paths)
                 ):
                     logger.info(
-                        "GIF: {}/{} кадров",
+                        "GIF | {}/{} кадров",
                         index,
                         len(paths),
                     )
@@ -1042,18 +838,34 @@ def run(cfg, objective=mean_normal_cwef):
         directory,
     )
 
-    started = time.perf_counter()
     evaluator = None
     recorder = None
+    started = time.perf_counter()
 
     try:
         logger.info(
-            "DALAIN | связный намыв без новых озёр"
+            "DALAIN | якорная локальная эволюция"
         )
 
         logger.info(
-            "Каталог результатов: {}",
-            directory,
+            "Исходная точка: lon={}, lat={}",
+            cfg.center_lon,
+            cfg.center_lat,
+        )
+
+        logger.info(
+            "Локальное изменение: доля={}, "
+            "максимум удаляемых клеток={}, попыток={}",
+            LOCAL_MUTATION_FRACTION,
+            LOCAL_MUTATION_MAX_CELLS,
+            LOCAL_MUTATION_ATTEMPTS,
+        )
+
+        logger.warning(
+            "Используется один принятый родитель "
+            "и его локальные варианты. "
+            "Старые mutation_fraction и elite_count "
+            "не задают размер изменения и число родителей."
         )
 
         with stage(
@@ -1076,32 +888,49 @@ def run(cfg, objective=mean_normal_cwef):
 
             import PIL
 
+        # Якорь проверяется до сетевого скачивания.
+        with stage(
+            "Геометрия и проверка исходной точки"
+        ):
+            geometry = AnchoredGeometry(cfg)
+
         from .bathymetry import prepare_bathymetry
-        from .geometry import Geometry
 
         with stage("Подготовка батиметрии"):
             cfg = prepare_bathymetry(cfg)
 
-        name = getattr(
+        objective_name = getattr(
             objective,
             "__name__",
             type(objective).__name__,
         )
 
-        (directory / "config.json").write_text(
-            json.dumps(
-                {
-                    **asdict(cfg),
-                    "objective": name,
-                    "geometry_algorithm": (
-                        "local_land_no_lakes_stable_points_v2"
+        write_json(
+            directory / "config.json",
+            {
+                **json.loads(
+                    json.dumps(
+                        asdict(cfg),
+                        default=str,
+                    )
+                ),
+                "objective": objective_name,
+                "evolution": {
+                    "mode": "anchored_1_plus_lambda",
+                    "anchor_cell": [0, 0],
+                    "local_mutation_fraction": (
+                        LOCAL_MUTATION_FRACTION
                     ),
+                    "local_mutation_max_cells": (
+                        LOCAL_MUTATION_MAX_CELLS
+                    ),
+                    "local_mutation_attempts": (
+                        LOCAL_MUTATION_ATTEMPTS
+                    ),
+                    "random_epoch_restart": False,
+                    "whole_shape_translation": False,
                 },
-                default=str,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+            },
         )
 
         if cfg.bathymetry_path is not None:
@@ -1116,11 +945,6 @@ def run(cfg, objective=mean_normal_cwef):
                     directory / "bathymetry_manifest.json",
                 )
 
-        with stage(
-            "Локальная суша, исходные точки и сетка"
-        ):
-            geometry = Geometry(cfg)
-
         evaluator = Evaluator(
             cfg,
             geometry,
@@ -1130,17 +954,15 @@ def run(cfg, objective=mean_normal_cwef):
             cfg,
             geometry,
             directory,
-            name,
+            objective_name,
         )
 
         with stage(
-            "Исходное состояние без намыва"
+            "Исходный берег без намыва"
         ):
-            evaluator.baseline = (
-                evaluator.calculate(
-                    frozenset(),
-                    "Исходный берег",
-                )
+            evaluator.baseline = evaluator.calculate(
+                frozenset(),
+                "Исходный берег",
             )
 
         baseline = evaluator.baseline
@@ -1155,72 +977,138 @@ def run(cfg, objective=mean_normal_cwef):
             -1, -1, -1,
         )
 
-        logger.success(
-            "Исходный CWEF={:.6f} Вт/м | точек={}",
-            baseline.mean_cwef,
-            len(baseline.scenario.sites),
+        # Один генератор и один строитель на весь запуск.
+        # Эпохи не создают новую случайную фигуру.
+        rng = random.Random(
+            cfg.random_seed
         )
+
+        builder = GeneticBuilder(
+            cfg,
+            geometry,
+            rng,
+        )
+
+        with stage(
+            "Построение первого якорного намыва"
+        ):
+            parent_cells = builder.initial()
+
+        parent_result = evaluator.evaluate(
+            parent_cells,
+            "Первый якорный намыв",
+        )
+
+        parent_score = checked_score(
+            objective,
+            parent_result,
+            baseline,
+        )
+
+        parent_path, parent_id = recorder.save(
+            parent_result,
+            parent_score,
+            0, -1, 0,
+        )
+
+        recorder.accept(
+            parent_path
+        )
+
+        history = [
+            parent_score
+        ]
 
         color_max = max(
             row["mean_CWEF_Wm"]
             for row in baseline.metrics
         )
 
-        best_cells = None
-        best_score = math.inf
-        best_mean = None
-
-        history = []
-
-        total = (
-            cfg.epochs
-            * cfg.generations
-            * cfg.population_size
+        recorder.frame(
+            parent_result,
+            0,
+            -1,
+            history,
+            color_max,
         )
-        completed = 0
+
+        donor_pool = [
+            parent_cells
+        ]
+
+        donor_scores = [
+            parent_score
+        ]
+
+        def choose_donor():
+            indices = [
+                rng.randrange(
+                    len(donor_pool)
+                )
+                for _ in range(
+                    cfg.tournament_size
+                )
+            ]
+
+            index = min(
+                indices,
+                key=lambda i: donor_scores[i],
+            )
+
+            return donor_pool[index]
 
         for epoch in range(cfg.epochs):
-            rng = random.Random(
-                cfg.random_seed + epoch
+            logger.info(
+                "ЭПОХА {}/{} | продолжение от {} | "
+                "score={:.6f}",
+                epoch + 1,
+                cfg.epochs,
+                parent_id,
+                parent_score,
             )
-
-            builder = GeneticBuilder(
-                cfg,
-                geometry,
-                rng,
-            )
-
-            with stage(
-                f"Эпоха {epoch + 1}: начальная популяция"
-            ):
-                population = [
-                    builder.build()
-                    for _ in range(
-                        cfg.population_size
-                    )
-                ]
-
-                if best_cells is not None:
-                    population[0] = best_cells
 
             for generation in range(
                 cfg.generations
             ):
-                scores = []
                 generation_started = (
                     time.perf_counter()
                 )
 
-                logger.info(
-                    "ПОКОЛЕНИЕ | эпоха {}/{} | {}/{}",
-                    epoch + 1,
-                    cfg.epochs,
-                    generation + 1,
-                    cfg.generations,
-                )
+                # Один неизменный родитель
+                # для всех вариантов этого поколения.
+                source_cells = parent_cells
+                source_result = parent_result
+                source_score = parent_score
+                source_id = parent_id
 
-                for individual in range(
-                    cfg.population_size
+                population = [
+                    source_cells
+                ]
+
+                with stage(
+                    "Локальные варианты принятого решения"
+                ):
+                    while (
+                        len(population)
+                        < cfg.population_size
+                    ):
+                        population.append(
+                            builder.child(
+                                source_cells,
+                                choose_donor(),
+                            )
+                        )
+
+                winner_cells = source_cells
+                winner_result = source_result
+                winner_score = source_score
+                winner_path = None
+                winner_id = source_id
+
+                scores = []
+
+                for individual, cells in enumerate(
+                    population
                 ):
                     label = (
                         f"Э{epoch + 1}/"
@@ -1228,51 +1116,57 @@ def run(cfg, objective=mean_normal_cwef):
                         f"О{individual + 1}"
                     )
 
-                    # Геометрическая неоднозначность
-                    # не завершает весь расчёт.
-                    for retry in range(50):
-                        cells = population[individual]
+                    removed = source_cells - cells
+                    added = cells - source_cells
+                    limit = builder.change_limit(
+                        source_cells
+                    )
 
-                        cached = (
-                            evaluator.cache.contains(cells)
-                        )
-
-                        logger.info(
-                            "{} | оценка {}/{} | "
-                            "кеш={} | попытка={}",
-                            label,
-                            completed + 1,
-                            total,
-                            cached,
-                            retry + 1,
-                        )
-
-                        try:
-                            result = evaluator.evaluate(
-                                cells,
-                                label,
-                            )
-                            break
-
-                        except InvalidScenarioError as error:
-                            recorder.reject(
-                                cells,
-                                error,
-                                epoch,
-                                generation,
-                                individual,
-                            )
-
-                            population[individual] = (
-                                builder.build()
-                            )
-
-                    else:
+                    if (
+                        len(removed) > limit
+                        or len(added) > 2 * limit
+                    ):
                         raise RuntimeError(
-                            "Не удалось получить геометрически "
-                            "однозначного кандидата за 50 попыток. "
-                            "Проверьте исходный берег."
+                            "Нарушен предел "
+                            "локальной деформации"
                         )
+
+                    logger.info(
+                        "{} | родитель={} | "
+                        "удалено={} | добавлено={} | "
+                        "якорь={}",
+                        label,
+                        source_id,
+                        len(removed),
+                        len(added),
+                        (0, 0) in cells,
+                    )
+
+                    cached = (
+                        evaluator.cache.contains(cells)
+                    )
+
+                    try:
+                        result = evaluator.evaluate(
+                            cells,
+                            label,
+                        )
+
+                    except InvalidScenarioError as error:
+                        recorder.reject(
+                            cells,
+                            error,
+                            epoch,
+                            generation,
+                            individual,
+                        )
+
+                        # Не создаём новый случайный намыв.
+                        cells = source_cells
+                        population[individual] = cells
+
+                        result = source_result
+                        cached = True
 
                     score = checked_score(
                         objective,
@@ -1280,64 +1174,69 @@ def run(cfg, objective=mean_normal_cwef):
                         baseline,
                     )
 
-                    path = recorder.save(
+                    path, solution_id = recorder.save(
                         result,
                         score,
                         epoch,
                         generation,
                         individual,
-                        cached,
+                        parent_cells=source_cells,
+                        parent_solution_id=source_id,
+                        cached=cached,
                     )
 
                     scores.append(score)
-                    completed += 1
 
-                    if score < best_score:
-                        best_cells = cells
-                        best_score = score
-                        best_mean = result.mean_cwef
+                    # При равном критерии сохраняем
+                    # прежнее принятое решение.
+                    if score < winner_score:
+                        winner_cells = cells
+                        winner_result = result
+                        winner_score = score
+                        winner_path = path
+                        winner_id = solution_id
 
-                        shutil.copyfile(
-                            path,
-                            directory / "best.geojson",
-                        )
+                if winner_path is not None:
+                    recorder.accept(
+                        winner_path
+                    )
 
-                        logger.success(
-                            "НОВЫЙ ЛУЧШИЙ | "
-                            "CWEF={:.6f} Вт/м | точек={}",
-                            best_mean,
-                            len(result.scenario.sites),
-                        )
+                    logger.success(
+                        "ПРИНЯТО | {} -> {} | "
+                        "score {:.6f} -> {:.6f} | "
+                        "удалено={} | добавлено={}",
+                        source_id,
+                        winner_id,
+                        source_score,
+                        winner_score,
+                        len(source_cells - winner_cells),
+                        len(winner_cells - source_cells),
+                    )
 
-                order = sorted(
-                    range(len(population)),
-                    key=lambda index: (
-                        scores[index],
-                        tuple(
-                            sorted(
-                                population[index]
-                            )
-                        ),
-                    ),
-                )
+                else:
+                    logger.info(
+                        "УЛУЧШЕНИЯ НЕТ | "
+                        "сохранён родитель {}",
+                        source_id,
+                    )
 
-                index = order[0]
+                parent_cells = winner_cells
+                parent_result = winner_result
+                parent_score = winner_score
+                parent_id = winner_id
 
-                result = evaluator.evaluate(
-                    population[index],
-                    "Кадр текущего поколения",
-                )
+                donor_pool = population
+                donor_scores = scores
 
                 history.append(
-                    best_score
+                    parent_score
                 )
 
                 with stage(
-                    "Сохранение кадра поколения"
+                    "Кадр принятой траектории"
                 ):
                     recorder.frame(
-                        population,
-                        result,
+                        parent_result,
                         epoch,
                         generation,
                         history,
@@ -1345,109 +1244,78 @@ def run(cfg, objective=mean_normal_cwef):
                     )
 
                 logger.info(
-                    "ИТОГ | min={:.6f} | mean={:.6f} | "
-                    "global={:.6f} | {:.1f} с",
-                    min(scores),
-                    float(np.mean(scores)),
-                    best_score,
+                    "ИТОГ ПОКОЛЕНИЯ | "
+                    "принятое решение={} | "
+                    "score={:.6f} | "
+                    "CWEF={:.6f} Вт/м | {:.1f} с",
+                    parent_id,
+                    parent_score,
+                    parent_result.mean_cwef,
                     time.perf_counter() - generation_started,
                 )
 
                 evaluator.log_cache()
 
-                if (
-                    generation + 1
-                    == cfg.generations
-                ):
-                    continue
-
-                def tournament():
-                    indices = [
-                        rng.randrange(
-                            len(population)
-                        )
-                        for _ in range(
-                            cfg.tournament_size
-                        )
-                    ]
-
-                    return population[
-                        min(
-                            indices,
-                            key=lambda index: scores[index],
-                        )
-                    ]
-
-                with stage(
-                    "Кроссовер и мутация без замкнутых полостей"
-                ):
-                    children = [
-                        population[index]
-                        for index in order[
-                            :cfg.elite_count
-                        ]
-                    ]
-
-                    while (
-                        len(children)
-                        < cfg.population_size
-                    ):
-                        children.append(
-                            builder.child(
-                                tournament(),
-                                tournament(),
-                            )
-                        )
-
-                    population = children
-
-        with stage("Создание анимации"):
+        with stage(
+            "Анимация принятой траектории"
+        ):
             recorder.animate()
 
-        summary = {
-            "objective": name,
-            "baseline_mean_CWEF_Wm": (
-                baseline.mean_cwef
-            ),
-            "best_mean_CWEF_Wm": best_mean,
-            "best_score": best_score,
-            "target_area_m2": cfg.target_area_m2,
-            "solutions": recorder.sequence,
-            "rejected_scenarios": (
-                recorder.rejected_count
-            ),
-            "frames": recorder.frame_count,
-            "elapsed_seconds": (
-                time.perf_counter() - started
-            ),
-            "relative_change_percent": (
-                100
-                * (
-                    best_mean
-                    / baseline.mean_cwef
-                    - 1
-                )
-                if baseline.mean_cwef > 0
-                else None
-            ),
-        }
-
-        (directory / "summary.json").write_text(
-            json.dumps(
-                summary,
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False,
-            ),
-            encoding="utf-8",
+        write_json(
+            directory / "summary.json",
+            {
+                "objective": objective_name,
+                "baseline_mean_CWEF_Wm": (
+                    baseline.mean_cwef
+                ),
+                "best_mean_CWEF_Wm": (
+                    parent_result.mean_cwef
+                ),
+                "best_score": parent_score,
+                "best_solution_id": parent_id,
+                "anchor_lon": cfg.center_lon,
+                "anchor_lat": cfg.center_lat,
+                "anchor_inside": (
+                    parent_result.scenario.fill.contains(
+                        geometry.anchor_point
+                    )
+                ),
+                "target_area_m2": cfg.target_area_m2,
+                "solutions": recorder.sequence,
+                "accepted_solutions": (
+                    recorder.accepted_count
+                ),
+                "rejected_scenarios": (
+                    recorder.rejected_count
+                ),
+                "frames": recorder.frame_count,
+                "elapsed_seconds": (
+                    time.perf_counter() - started
+                ),
+                "relative_change_percent": (
+                    100
+                    * (
+                        parent_result.mean_cwef
+                        / baseline.mean_cwef
+                        - 1
+                    )
+                    if baseline.mean_cwef > 0
+                    else None
+                ),
+            },
         )
 
         logger.success(
-            "РАСЧЁТ ЗАВЕРШЁН | "
-            "исходный CWEF={:.6f} | "
-            "лучший CWEF={:.6f}",
-            baseline.mean_cwef,
-            best_mean,
+            "ЗАВЕРШЕНО | "
+            "решение={} | CWEF={:.6f} Вт/м | "
+            "якорь внутри=True",
+            parent_id,
+            parent_result.mean_cwef,
+        )
+
+        logger.success(
+            "Результаты: {}",
+            directory,
         )
 
         return directory

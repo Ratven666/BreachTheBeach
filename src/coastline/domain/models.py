@@ -1,6 +1,7 @@
+# src/coastline/domain/models.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -42,3 +43,16 @@ class CoastlineSummary:
             "other_total_length": self.other_total_length,
             "total_length": self.total_length,
         }
+
+
+@dataclass
+class PointSetMeta:
+    name: str
+    source_dataset_name: str   # путь к GeoJSON-файлу
+    strategy_name: str
+    source_mode: str
+    points_count: int
+    # Все численные и строковые параметры стратегии.
+    # Заполняются в PointExtractionStrategy.build_meta() — экспортёр
+    # не должен иметь доступ к объекту стратегии напрямую.
+    strategy_params: dict[str, Any] = field(default_factory=dict)

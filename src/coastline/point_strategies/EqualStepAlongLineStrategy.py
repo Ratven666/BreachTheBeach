@@ -164,3 +164,14 @@ class EqualStepAlongLineStrategy(PointExtractionStrategy):
 
         merged = linemerge(lines)
         return merged
+
+    @property
+    def params(self) -> dict:
+        return {
+            **super().params,
+            "step_m": self.step_m,
+            "include_endpoints": self.include_endpoints,
+            "working_crs": self.working_crs,
+            "input_crs": self.input_crs,
+        }
+

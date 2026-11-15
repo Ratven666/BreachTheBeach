@@ -356,57 +356,298 @@ class CoastlineNormalService:
             "normal_azimuth_deg": azimuth_deg,
         }
 
+    # def _tangent_points(
+    #     self,
+    #     coastline: LineString,
+    #     chainage: float,
+    # ) -> tuple[Point, Point, float]:
+    #     """
+    #     Центральная разность по линии; при вырождении интервал
+    #     увеличивается, затем применяется односторонняя разность.
+    #     Порядок p0 -> p1 всегда совпадает с направлением линии.
+    #     """
+    #     length = float(coastline.length)
+    #     if length <= 0:
+    #         raise ValueError("Reference coastline has zero length")
+    #
+    #     requested_delta = max(float(self.config.tangent_delta_m), 0.01)
+    #     delta = min(requested_delta, length)
+    #
+    #     for _ in range(16):
+    #         s0 = max(0.0, chainage - delta)
+    #         s1 = min(length, chainage + delta)
+    #
+    #         if s1 > s0:
+    #             p0 = coastline.interpolate(s0)
+    #             p1 = coastline.interpolate(s1)
+    #             if p0.distance(p1) > 1e-9:
+    #                 return p0, p1, delta
+    #
+    #         if delta >= length:
+    #             break
+    #         delta = min(length, delta * 2.0)
+    #
+    #     center = coastline.interpolate(chainage)
+    #     delta = min(requested_delta, length)
+    #
+    #     while delta <= length:
+    #         forward_s = min(length, chainage + delta)
+    #         if forward_s > chainage:
+    #             forward = coastline.interpolate(forward_s)
+    #             if center.distance(forward) > 1e-9:
+    #                 return center, forward, delta
+    #
+    #         backward_s = max(0.0, chainage - delta)
+    #         if backward_s < chainage:
+    #             backward = coastline.interpolate(backward_s)
+    #             if backward.distance(center) > 1e-9:
+    #                 return backward, center, delta
+    #
+    #         if delta >= length:
+    #             break
+    #         delta = min(length, delta * 2.0)
+    #
+    #     raise ValueError(
+    #         "Failed to find a non-zero local segment for tangent calculation"
+    #     )
+
     def _tangent_points(
         self,
         coastline: LineString,
         chainage: float,
     ) -> tuple[Point, Point, float]:
         """
-        Центральная разность по линии; при вырождении интервал
-        увеличивается, затем применяется односторонняя разность.
-        Порядок p0 -> p1 всегда совпадает с направлением линии.
+        Выбирает две разные точки для оценки касательной.
+
+        Особенности:
+        - сохраняет исходное направление линии;
+        - для замкнутых линий использует циклический отсчёт;
+        - при совпадении точек уменьшает интервал;
+        - при необходимости использует одностороннюю разность;
+        - крайний резерв — ближайшее ненулевое ребро.
+
+        Возвращает:
+            p0, p1, фактически использованный интервал.
         """
         length = float(coastline.length)
-        if length <= 0:
-            raise ValueError("Reference coastline has zero length")
 
-        requested_delta = max(float(self.config.tangent_delta_m), 0.01)
-        delta = min(requested_delta, length)
+        if not math.isfinite(length) or length <= 0.0:
+            raise ValueError(
+                f"Reference coastline has invalid length: {length!r}"
+            )
 
-        for _ in range(16):
-            s0 = max(0.0, chainage - delta)
-            s1 = min(length, chainage + delta)
+        if not math.isfinite(chainage):
+            raise ValueError(
+                f"Non-finite chainage: {chainage!r}"
+            )
 
-            if s1 > s0:
-                p0 = coastline.interpolate(s0)
-                p1 = coastline.interpolate(s1)
-                if p0.distance(p1) > 1e-9:
-                    return p0, p1, delta
+        coordinates = list(coastline.coords)
 
-            if delta >= length:
+        if len(coordinates) < 2:
+            raise ValueError(
+                "Reference coastline has fewer than two vertices"
+            )
+
+        for index, coordinate in enumerate(coordinates):
+            if not (
+                math.isfinite(coordinate[0])
+                and math.isfinite(coordinate[1])
+            ):
+                raise ValueError(
+                    "Reference coastline contains non-finite "
+                    f"coordinates at vertex {index}"
+                )
+
+        requested_delta = float(self.config.tangent_delta_m)
+
+        if (
+            not math.isfinite(requested_delta)
+            or requested_delta <= 0.0
+        ):
+            raise ValueError(
+                "tangent_delta_m must be finite and positive"
+            )
+
+        chainage = min(max(float(chainage), 0.0), length)
+        closed = bool(coastline.is_closed)
+
+        # Масштабно-зависимый порог: отличаем полезное смещение
+        # от погрешности представления координат.
+        coordinate_scale = max(
+            1.0,
+            max(
+                abs(value)
+                for coordinate in coordinates
+                for value in coordinate[:2]
+            ),
+        )
+
+        coordinate_tolerance = max(
+            1e-9,
+            8.0 * math.ulp(coordinate_scale),
+        )
+
+        def different(p0: Point, p1: Point) -> bool:
+            return (
+                math.isfinite(p0.x)
+                and math.isfinite(p0.y)
+                and math.isfinite(p1.x)
+                and math.isfinite(p1.y)
+                and p0.distance(p1) > coordinate_tolerance
+            )
+
+        if closed:
+            # Не допускаем охвата всего кольца или двух его
+            # половин с совпадающими положениями.
+            initial_delta = min(
+                requested_delta,
+                length / 4.0,
+            )
+
+            center_s = chainage % length
+
+            def point_at(distance: float) -> Point:
+                return coastline.interpolate(distance % length)
+
+        else:
+            initial_delta = min(
+                requested_delta,
+                length,
+            )
+
+            center_s = chainage
+
+            def point_at(distance: float) -> Point:
+                return coastline.interpolate(
+                    min(max(distance, 0.0), length)
+                )
+
+        # Сначала пытаемся сохранить центральную оценку.
+        # При вырождении уменьшаем окно, а не увеличиваем
+        # его вплоть до полного охвата короткого кольца.
+        delta = initial_delta
+
+        for _ in range(32):
+            if delta <= 0.0:
                 break
-            delta = min(length, delta * 2.0)
 
-        center = coastline.interpolate(chainage)
-        delta = min(requested_delta, length)
+            if closed:
+                p0 = point_at(center_s - delta)
+                p1 = point_at(center_s + delta)
 
-        while delta <= length:
-            forward_s = min(length, chainage + delta)
-            if forward_s > chainage:
-                forward = coastline.interpolate(forward_s)
-                if center.distance(forward) > 1e-9:
+            else:
+                s0 = max(0.0, center_s - delta)
+                s1 = min(length, center_s + delta)
+
+                p0 = point_at(s0)
+                p1 = point_at(s1)
+
+            if different(p0, p1):
+                return p0, p1, delta
+
+            delta *= 0.5
+
+        # На возвратном участке центральная разность может
+        # выродиться даже при корректной ненулевой геометрии.
+        # Пробуем односторонние разности, сохраняя порядок.
+        center = point_at(center_s)
+        delta = initial_delta
+
+        for _ in range(32):
+            if delta <= 0.0:
+                break
+
+            if closed or center_s + delta <= length:
+                forward = point_at(center_s + delta)
+
+                if different(center, forward):
                     return center, forward, delta
 
-            backward_s = max(0.0, chainage - delta)
-            if backward_s < chainage:
-                backward = coastline.interpolate(backward_s)
-                if backward.distance(center) > 1e-9:
+            if closed or center_s - delta >= 0.0:
+                backward = point_at(center_s - delta)
+
+                if different(backward, center):
                     return backward, center, delta
 
-            if delta >= length:
-                break
-            delta = min(length, delta * 2.0)
+            delta *= 0.5
+
+        # Резерв: выбираем ненулевое ребро, ближайшее
+        # по расстоянию вдоль линии к искомой позиции.
+        #
+        # Направление ребра остаётся исходным: vertex[i]
+        # -> vertex[i + 1]. Никакого reverse/linemerge.
+        best_candidate = None
+        best_score = math.inf
+
+        accumulated = 0.0
+
+        for start_coordinate, end_coordinate in zip(
+            coordinates,
+            coordinates[1:],
+        ):
+            p0 = Point(
+                start_coordinate[0],
+                start_coordinate[1],
+            )
+
+            p1 = Point(
+                end_coordinate[0],
+                end_coordinate[1],
+            )
+
+            edge_length = float(p0.distance(p1))
+
+            edge_start = accumulated
+            edge_end = accumulated + edge_length
+            accumulated = edge_end
+
+            if edge_length <= coordinate_tolerance:
+                continue
+
+            def distance_to_interval(position: float) -> float:
+                if position < edge_start:
+                    return edge_start - position
+
+                if position > edge_end:
+                    return position - edge_end
+
+                return 0.0
+
+            if closed:
+                score = min(
+                    distance_to_interval(center_s - length),
+                    distance_to_interval(center_s),
+                    distance_to_interval(center_s + length),
+                )
+            else:
+                score = distance_to_interval(center_s)
+
+            if score < best_score:
+                best_score = score
+
+                best_candidate = (
+                    p0,
+                    p1,
+                    min(requested_delta, edge_length),
+                )
+
+        if best_candidate is not None:
+            self._log.warning(
+                "Tangent fallback: using a non-zero edge; "
+                "chainage={:.6f}, length={:.6f}, closed={}",
+                chainage,
+                length,
+                closed,
+            )
+
+            return best_candidate
 
         raise ValueError(
-            "Failed to find a non-zero local segment for tangent calculation"
+            "Cannot calculate a stable tangent: "
+            "no edge exceeds the coordinate precision threshold; "
+            f"length={length:.12g}, "
+            f"chainage={chainage:.12g}, "
+            f"closed={closed}, "
+            f"vertices={len(coordinates)}, "
+            f"tolerance={coordinate_tolerance:.12g}"
         )

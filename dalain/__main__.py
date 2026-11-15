@@ -25,8 +25,8 @@ def main():
 
         center_lon=19.95,
         center_lat=54.74,
-        target_area_m2=1_00_000.0,
-        cell_side_m=10.0,
+        target_area_m2=1_000_000.0,
+        cell_side_m=20.0,
         connection="attached",
         start_date="2025-01-01",
         end_date="2025-12-31",

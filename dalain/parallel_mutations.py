@@ -1,4 +1,8 @@
-"""Постоянный spawn-пул и сборка поколения без копий родителя."""
+"""Постоянный spawn-пул.
+
+Размер нового поколения может быть меньше запроса.
+Копии родителя и точные дубликаты не возвращаются.
+"""
 
 from concurrent.futures import (
     ProcessPoolExecutor,
@@ -8,6 +12,7 @@ from concurrent.futures import (
 )
 
 from dataclasses import dataclass, replace
+from collections import Counter
 
 import hashlib
 import multiprocessing as mp
@@ -53,12 +58,7 @@ MAX_PENDING_PER_WORKER = 2
 PROGRESS_INTERVAL_S = 5.0
 
 DIRECTION_SECTORS = 8
-
-# Максимум партий добора одного поколения.
-MAX_GENERATION_ROUNDS = 4
-
-# Попарное расстояние:
-# len(A ^ B) / (2 * N).
+MAX_GENERATION_ROUNDS = 2
 MIN_PAIR_DISTANCE = 0.02
 
 
@@ -87,29 +87,16 @@ class MutationResult:
 
 
 class InsufficientDiversityError(RuntimeError):
-    def __init__(
-        self,
-        requested,
-        results,
-        diagnostics,
-    ):
-        self.requested = requested
-        self.results = tuple(results)
-        self.diagnostics = diagnostics
+    """Совместимость импортов.
 
-        super().__init__(
-            "Недостаточно разных мутаций: "
-            f"{len(results)}/{requested}. "
-            f"Диагностика: {diagnostics}. "
-            "Копии родителя не подставлялись."
-        )
+    generate() больше не возбуждает это исключение.
+    """
 
 
 def cell_distance(first, second):
     if len(first) != len(second):
         raise ValueError(
-            "Для этого расстояния нужно "
-            "одинаковое количество клеток"
+            "Нужно одинаковое число клеток"
         )
 
     if not first:
@@ -121,12 +108,7 @@ def cell_distance(first, second):
     )
 
 
-def select_diverse(
-    results,
-    count,
-    threshold,
-):
-    """Детерминированный max-min отбор из уникальных форм."""
+def select_diverse(results, count, threshold):
     if not results or count == 0:
         return []
 
@@ -147,11 +129,8 @@ def select_diverse(
         for result in remaining
     }
 
-    while (
-        remaining
-        and len(selected) < count
-    ):
-        candidate = max(
+    while remaining and len(selected) < count:
+        row = max(
             remaining,
             key=lambda result: (
                 distances[result.index],
@@ -159,21 +138,18 @@ def select_diverse(
             ),
         )
 
-        if (
-            distances[candidate.index] + 1e-12
-            < threshold
-        ):
+        if distances[row.index] + 1e-12 < threshold:
             break
 
-        selected.append(candidate)
-        remaining.remove(candidate)
+        selected.append(row)
+        remaining.remove(row)
 
-        for result in remaining:
-            distances[result.index] = min(
-                distances[result.index],
+        for other in remaining:
+            distances[other.index] = min(
+                distances[other.index],
                 cell_distance(
-                    result.cells,
-                    candidate.cells,
+                    other.cells,
+                    row.cells,
                 ),
             )
 
@@ -236,9 +212,9 @@ def make_task(
         parent=parent,
         donor=donor,
         plan=MutationPlan(
-            azimuth_deg=azimuth % 360,
-            strip_position=position,
-            strength=strength,
+            azimuth % 360,
+            position,
+            strength,
         ),
     )
 
@@ -253,14 +229,14 @@ def _geometry_snapshot(geometry):
         geometry.geod.initstring,
     )
 
-    for key in (
+    for name in (
         "crs",
         "geod",
         "to_metric",
         "to_lonlat",
         "line_tree",
     ):
-        state.pop(key, None)
+        state.pop(name, None)
 
     return pickle.dumps(
         (state, metadata),
@@ -280,10 +256,7 @@ def _restore_geometry(
 
     from shapely import STRtree
 
-    state, metadata = pickle.loads(
-        snapshot
-    )
-
+    state, metadata = pickle.loads(snapshot)
     wkt, geod_init = metadata
 
     geometry = geometry_type.__new__(
@@ -351,10 +324,7 @@ def _initialize(
     )
 
 
-def _run_task(
-    task,
-    context=None,
-):
+def _run_task(task, context=None):
     from .geometry import InvalidScenarioError
 
     started = time.perf_counter()
@@ -402,19 +372,14 @@ def _run_task(
                 or (
                     changed
                     and not (
-                        builder.minimum_change(
-                            task.parent
-                        )
+                        builder.minimum_change(task.parent)
                         <= changed
-                        <= builder.change_limit(
-                            task.parent
-                        )
+                        <= builder.change_limit(task.parent)
                     )
                 )
             ):
                 raise RuntimeError(
-                    "Worker нарушил "
-                    "инварианты мутации"
+                    "Worker нарушил инварианты мутации"
                 )
 
             stats = dict(
@@ -490,8 +455,7 @@ class ParallelMutationPool:
             )
         ):
             raise ValueError(
-                "workers и rounds должны быть "
-                "целыми и > 0"
+                "workers и rounds должны быть целыми и > 0"
             )
 
         if not 0 <= min_distance <= 1:
@@ -499,13 +463,9 @@ class ParallelMutationPool:
                 "min_distance должно лежать в [0, 1]"
             )
 
-        if (
-            builder.geometry.fixed_cell_count
-            is None
-        ):
+        if builder.geometry.fixed_cell_count is None:
             raise ValueError(
-                "Создавайте пул "
-                "после builder.initial()"
+                "Создавайте пул после builder.initial()"
             )
 
         self.backend = backend
@@ -525,7 +485,6 @@ class ParallelMutationPool:
 
         self._closed = False
         self._busy = False
-
         self.executor = None
 
         context = mp.get_context(
@@ -625,21 +584,12 @@ class ParallelMutationPool:
 
         return self
 
-    def __exit__(
-        self,
-        exc_type,
-        exc,
-        tb,
-    ):
+    def __exit__(self, exc_type, exc, tb):
         self.close(
             abort=exc_type is not None
         )
 
-    def _execute(
-        self,
-        tasks,
-        label,
-    ):
+    def _execute(self, tasks, label):
         results = []
 
         if self.backend == "serial":
@@ -661,21 +611,17 @@ class ParallelMutationPool:
 
         pending = {}
         iterator = iter(tasks)
+        exhausted = False
 
         started = time.perf_counter()
         last_log = started
-
-        exhausted = False
 
         try:
             while pending or not exhausted:
                 while (
                     not exhausted
                     and len(pending)
-                    < (
-                        self.workers
-                        * MAX_PENDING_PER_WORKER
-                    )
+                    < self.workers * MAX_PENDING_PER_WORKER
                 ):
                     task = next(
                         iterator,
@@ -751,8 +697,7 @@ class ParallelMutationPool:
     ):
         if self._closed or self._busy:
             raise RuntimeError(
-                "Пул закрыт или уже "
-                "выполняет generate()"
+                "Пул закрыт или уже выполняет generate()"
             )
 
         self.last_results = []
@@ -771,49 +716,34 @@ class ParallelMutationPool:
             )
         ):
             raise ValueError(
-                "Нужны одинаковые количества "
-                "доноров и целочисленных seed"
+                "Нужны одинаковые количества доноров "
+                "и целочисленных seed"
             )
 
         wanted = len(seeds)
 
-        if wanted == 0:
+        if not wanted:
             return []
 
         started = time.perf_counter()
 
         unique = {}
-
         parent_returns = 0
         duplicates = 0
-
-        rotation = (
-            seeds[0] % DIRECTION_SECTORS
-        )
-
         selected = []
 
         self._busy = True
 
         try:
-            for round_index in range(
-                self.rounds
-            ):
-                # Партии фиксированы:
-                # скорость workers не меняет план добора.
+            for round_index in range(self.rounds):
                 tasks = [
                     make_task(
-                        index=(
-                            round_index * wanted
-                            + index
-                        ),
-                        round_index=round_index,
-                        parent=parent,
-                        donor=frozenset(
-                            donors[index]
-                        ),
-                        seed=seeds[index],
-                        rotation=rotation,
+                        round_index * wanted + index,
+                        round_index,
+                        parent,
+                        frozenset(donors[index]),
+                        seeds[index],
+                        seeds[0] % DIRECTION_SECTORS,
                     )
                     for index in range(wanted)
                 ]
@@ -855,10 +785,8 @@ class ParallelMutationPool:
                 )
 
                 logger.info(
-                    "{} | партия={} | "
-                    "уникальных={} | "
-                    "достаточно разных={}/{} | "
-                    "возвратов={}",
+                    "{} | партия={} | уникальных={} | "
+                    "достаточно разных={}/{} | возвратов={}",
                     label,
                     round_index + 1,
                     len(unique),
@@ -870,8 +798,8 @@ class ParallelMutationPool:
                 if len(selected) == wanted:
                     break
 
-            # Ослабляется только порог разнообразия.
-            # Геометрические ограничения не меняются.
+            # Ослабляется только порог попарного разнообразия.
+            # Геометрические ограничения остаются прежними.
             effective = self.min_distance
 
             if len(selected) < wanted:
@@ -888,53 +816,57 @@ class ParallelMutationPool:
                     if len(selected) == wanted:
                         break
 
-            actual_distance = min(
+            distance = min(
                 (
                     cell_distance(
                         first.cells,
                         second.cells,
                     )
-                    for index, first in enumerate(
-                        selected
-                    )
-                    for second in selected[
-                        index + 1:
-                    ]
+                    for index, first in enumerate(selected)
+                    for second in selected[index + 1:]
                 ),
                 default=None,
             )
 
-            self.last_stats = {
-                "requested": wanted,
-                "selected": len(selected),
-                "attempts": len(
-                    self.last_attempts
+            rejections = Counter()
+
+            for row in self.last_attempts:
+                rejections.update(
+                    row.stats.get(
+                        "rejections",
+                        {},
+                    )
+                )
+
+            self.last_stats = dict(
+                requested=wanted,
+                selected=len(selected),
+                partial=len(selected) < wanted,
+
+                attempts=len(self.last_attempts),
+                unique=len(unique),
+                parent_returns=parent_returns,
+                duplicates=duplicates,
+
+                effective_threshold=effective,
+                actual_min_distance=distance,
+
+                max_changed_seen=max(
+                    (
+                        row.stats.get(
+                            "best_changed_seen",
+                            0,
+                        )
+                        for row in self.last_attempts
+                    ),
+                    default=0,
                 ),
-                "unique": len(unique),
-                "parent_returns": parent_returns,
-                "duplicates": duplicates,
-                "effective_threshold": effective,
-                "actual_min_distance": actual_distance,
-                "seconds": (
+
+                rejections=dict(rejections),
+                seconds=(
                     time.perf_counter() - started
                 ),
-            }
-
-            if len(selected) < wanted:
-                raise InsufficientDiversityError(
-                    wanted,
-                    selected,
-                    self.last_stats,
-                )
-
-            if effective < self.min_distance:
-                logger.warning(
-                    "{} | порог разнообразия "
-                    "явно снижен: {} -> {}",
-                    label,
-                    self.min_distance,
-                    effective,
-                )
+            )
 
             self.last_results = [
                 replace(
@@ -947,26 +879,36 @@ class ParallelMutationPool:
                         ),
                     },
                 )
-                for index, result in enumerate(
-                    selected
-                )
+                for index, result in enumerate(selected)
             ]
 
-            logger.success(
-                "{} | собрано {} разных новых форм | "
-                "{:.2f} с",
+            if len(selected) < wanted:
+                logger.warning(
+                    "{} | неполное поколение: {}/{} | "
+                    "найденные формы передаются на оценку",
+                    label,
+                    len(selected),
+                    wanted,
+                )
+
+            if effective < self.min_distance:
+                logger.warning(
+                    "{} | порог разнообразия: {} -> {}",
+                    label,
+                    self.min_distance,
+                    effective,
+                )
+
+            logger.info(
+                "{} | диагностика: {}",
                 label,
-                wanted,
-                self.last_stats["seconds"],
+                self.last_stats,
             )
 
             return [
                 result.cells
                 for result in self.last_results
             ]
-
-        except InsufficientDiversityError:
-            raise
 
         except BaseException:
             self.close(abort=True)

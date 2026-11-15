@@ -1,4 +1,4 @@
-"""Якорный намыв и направленный поиск с ограниченным возвратом из тупиков."""
+"""Якорный намыв: направленные переносы и ограниченный поиск альтернатив."""
 
 import heapq
 import math
@@ -22,43 +22,36 @@ from .geometry import (
 
 ANCHOR_CELL = (0, 0)
 
-# Конечная симметрическая разность относительно родителя.
-# 10% изменённых позиций = 5% удалённых + 5% добавленных клеток.
-MIN_CHANGED_CELL_FRACTION = 0.10
-MAX_CHANGED_CELL_FRACTION = 0.25
+# MIN_CHANGED_CELL_FRACTION = 0.10
+# MAX_CHANGED_CELL_FRACTION = 0.25
+MIN_CHANGED_CELL_FRACTION = 0.05
+MAX_CHANGED_CELL_FRACTION = 0.10
 
-# Допуски смещения в сторонах клетки.
-# Для больших намывов масштабируются с sqrt(N).
+
+
 BASE_BOUNDARY_SHIFT_CELLS = 3.0
 BASE_CENTROID_SHIFT_CELLS = 1.0
 
 BOUNDARY_SHIFT_SCALE = 0.20
 CENTROID_SHIFT_SCALE = 0.08
 
-# Полуширина фиксированной полосы изменения.
 STRIP_HALF_WIDTH_FRACTION = 0.25
 STRIP_MIN_HALF_WIDTH_CELLS = 2.0
 
-# Ограничение изрезанности квадратного контура.
 MAX_PERIMETER_GROWTH_FRACTION = 0.15
 
-# Число рассматриваемых удалений и добавлений.
 REMOVAL_CHOICES = 12
 ADDITION_CHOICES = 12
-
-# Максимум дорогих проверок пар на одном состоянии.
 PAIR_CHECK_LIMIT = 32
 
-# Сколько уровней альтернатив сохраняется для возврата.
 BACKTRACK_DEPTH = 4
 
-# Бюджет исследования одной задачи мутации.
-MAX_SEARCH_NODES = 220
+MIN_SEARCH_NODES = 220
+SEARCH_NODES_PER_TARGET_MOVE = 3
 
 MAX_STAGNANT_MOVES = 8
 MAX_PATH_MOVES_FRACTION = 0.50
 
-# Совместимость с внешними импортами.
 LOCAL_MUTATION_FRACTION = MAX_CHANGED_CELL_FRACTION
 LOCAL_MUTATION_MAX_CELLS = None
 LOCAL_MUTATION_ATTEMPTS = PAIR_CHECK_LIMIT
@@ -87,28 +80,27 @@ class MutationPlan:
             and 0 <= self.strength <= 1
         ):
             raise ValueError(
-                "strip_position и strength "
-                "должны лежать в [0, 1]"
+                "strip_position и strength должны лежать в [0, 1]"
             )
 
 
 def floor_part(count, fraction):
-    value = Fraction(str(fraction))
+    ratio = Fraction(str(fraction))
 
     return (
         count
-        * value.numerator
-        // value.denominator
+        * ratio.numerator
+        // ratio.denominator
     )
 
 
 def ceil_part(count, fraction):
-    value = Fraction(str(fraction))
+    ratio = Fraction(str(fraction))
 
     return (
-        count * value.numerator
-        + value.denominator - 1
-    ) // value.denominator
+        count * ratio.numerator
+        + ratio.denominator - 1
+    ) // ratio.denominator
 
 
 def perimeter(cells):
@@ -136,15 +128,12 @@ class AnchoredGeometry(Geometry):
             )
         ):
             raise ValueError(
-                "Якорь (0, 0) не находится "
-                "внутри допустимой клетки"
+                "Якорь (0, 0) не находится внутри допустимой клетки"
             )
 
     def lock_cell_count(self, count):
         if type(count) is not int or count < 2:
-            raise ValueError(
-                "Нужно минимум два квадрата"
-            )
+            raise ValueError("Нужно минимум два квадрата")
 
         if self.fixed_cell_count not in (None, count):
             raise ValueError(
@@ -162,12 +151,10 @@ class AnchoredGeometry(Geometry):
             return False
 
         if self.fixed_cell_count is None:
-            units = sum(
-                self.units[cell]
-                for cell in cells
-            )
-
-            if units != self.cfg.target_units:
+            if (
+                sum(self.units[cell] for cell in cells)
+                != self.cfg.target_units
+            ):
                 return False
 
         elif len(cells) != self.fixed_cell_count:
@@ -260,20 +247,6 @@ class GeneticBuilder:
                 "Неверные доли изменения"
             )
 
-        for value in (
-            REMOVAL_CHOICES,
-            ADDITION_CHOICES,
-            PAIR_CHECK_LIMIT,
-            BACKTRACK_DEPTH,
-            MAX_SEARCH_NODES,
-            MAX_STAGNANT_MOVES,
-        ):
-            if type(value) is not int or value < 1:
-                raise ValueError(
-                    "Лимиты поиска должны быть "
-                    "целыми и > 0"
-                )
-
     def _check_cancelled(self):
         if (
             self.cancel_event is not None
@@ -359,9 +332,7 @@ class GeneticBuilder:
                 if other not in geometry.cells:
                     continue
 
-                value = (
-                    cost + geometry.units[other]
-                )
+                value = cost + geometry.units[other]
 
                 if (
                     value <= self.cfg.target_units
@@ -401,10 +372,8 @@ class GeneticBuilder:
                     self.center_water[other] = (
                         not self.geometry.local_land.covers(
                             Point(
-                                other[0]
-                                * self.cfg.cell_side_m,
-                                other[1]
-                                * self.cfg.cell_side_m,
+                                other[0] * self.cfg.cell_side_m,
+                                other[1] * self.cfg.cell_side_m,
                             )
                         )
                     )
@@ -412,10 +381,7 @@ class GeneticBuilder:
                 if self.center_water[other]:
                     free.add(other)
 
-        return (
-            not free
-            or is_connected(free)
-        )
+        return not free or is_connected(free)
 
     def _initial_grow(self, core):
         geometry = self.geometry
@@ -522,9 +488,7 @@ class GeneticBuilder:
 
         core = self._seed_core()
 
-        for _ in range(
-            self.cfg.construction_attempts
-        ):
+        for _ in range(self.cfg.construction_attempts):
             cells = self._initial_grow(core)
 
             if self._checked(cells):
@@ -537,8 +501,7 @@ class GeneticBuilder:
                 return cells
 
         raise RuntimeError(
-            "Не удалось построить "
-            "первый якорный намыв"
+            "Не удалось построить первый якорный намыв"
         )
 
     def _sea_frontiers(self, cells, fill=None):
@@ -634,20 +597,14 @@ class GeneticBuilder:
         return removable, addable
 
     def _alternatives(self, state, context):
-        (
-            cells,
-            fill,
-            trace,
-            boundary_length,
-            stagnant,
-        ) = state
+        cells, fill, trace, boundary_length, stagnant = state
 
         (
             parent,
             donor,
             vector,
-            strip_center,
-            strip_width,
+            center,
+            width,
             band,
             parent_fill,
             rejected,
@@ -659,13 +616,13 @@ class GeneticBuilder:
             return cell[0] * dx + cell[1] * dy
 
         def in_strip(cell):
-            transverse = (
-                -cell[0] * dy + cell[1] * dx
-            )
-
             return (
-                abs(transverse - strip_center)
-                <= strip_width + 1e-12
+                abs(
+                    -cell[0] * dy
+                    + cell[1] * dx
+                    - center
+                )
+                <= width + 1e-12
             )
 
         removable, addable = self._sea_frontiers(
@@ -674,19 +631,15 @@ class GeneticBuilder:
         )
 
         removable = [
-            cell
-            for cell in removable
+            cell for cell in removable
             if in_strip(cell)
         ]
 
         addable = [
-            cell
-            for cell in addable
+            cell for cell in addable
             if in_strip(cell)
         ]
 
-        # Шум влияет на числовую оценку,
-        # а не только разрывает равенство ключей.
         noise = {
             cell: self.rng.uniform(-1, 1)
             for cell in sorted(
@@ -703,16 +656,13 @@ class GeneticBuilder:
         )
 
         pairs = []
-
         before = len(parent ^ cells)
 
         limit = perimeter(parent) * (
             1 + MAX_PERIMETER_GROWTH_FRACTION
         )
 
-        for removed in removable[
-            :REMOVAL_CHOICES
-        ]:
+        for removed in removable[:REMOVAL_CHOICES]:
             self._check_cancelled()
 
             core = cells - {removed}
@@ -743,9 +693,7 @@ class GeneticBuilder:
                 for other in neighbours(removed)
             )
 
-            for added in options[
-                :ADDITION_CHOICES
-            ]:
+            for added in options[:ADDITION_CHOICES]:
                 displacement = (
                     projection(added)
                     - projection(removed)
@@ -755,9 +703,7 @@ class GeneticBuilder:
                     core | {added}
                 )
 
-                changed = len(
-                    parent ^ trial
-                )
+                changed = len(parent ^ trial)
 
                 shared_added = sum(
                     other in core
@@ -784,13 +730,6 @@ class GeneticBuilder:
                     rejected["perimeter"] += 1
                     continue
 
-                # Взвешенная случайная перестановка:
-                # хорошие пары вероятнее,
-                # но не выбираются безальтернативно.
-                compactness = (
-                    new_length - boundary_length
-                )
-
                 weight = (
                     1
                     if changed > before
@@ -800,12 +739,15 @@ class GeneticBuilder:
                 weight *= math.exp(
                     -0.35 * max(
                         -4,
-                        compactness,
+                        new_length - boundary_length,
                     )
                 )
 
-                if added in donor:
-                    weight *= 1.5
+                weight *= (
+                    1.5
+                    if added in donor
+                    else 1
+                )
 
                 weight *= (
                     1
@@ -896,30 +838,25 @@ class GeneticBuilder:
                 rejected["topology"] += 1
                 continue
 
-            new_trace = trace + (
-                ("remove", removed),
-                ("add", added),
-            )
-
-            new_stagnant = (
-                stagnant + 1
-                if changed == before
-                else 0
-            )
-
             yield (
                 trial,
                 new_fill,
-                new_trace,
+                trace + (
+                    ("remove", removed),
+                    ("add", added),
+                ),
                 new_length,
-                new_stagnant,
+                (
+                    stagnant + 1
+                    if changed == before
+                    else 0
+                ),
             )
 
     def mutate(self, parent, donor=frozenset()):
         parent = frozenset(parent)
 
         self.last_trace = ()
-
         self.last_stats = {
             "status": "searching",
             "changed_cell_count": 0,
@@ -945,7 +882,6 @@ class GeneticBuilder:
                 minimum=minimum,
                 maximum=maximum,
             )
-
             return parent
 
         plan = self.plan or MutationPlan(
@@ -972,8 +908,7 @@ class GeneticBuilder:
             for cell in sorted(parent)
         ]
 
-        low = min(cross)
-        high = max(cross)
+        low, high = min(cross), max(cross)
 
         width = max(
             STRIP_MIN_HALF_WIDTH_CELLS,
@@ -997,6 +932,12 @@ class GeneticBuilder:
                 / 2
                 * plan.strength
             )
+        )
+
+        node_limit = max(
+            MIN_SEARCH_NODES,
+            SEARCH_NODES_PER_TARGET_MOVE
+            * (target // 2),
         )
 
         parent_fill = self.geometry._fill(
@@ -1043,6 +984,7 @@ class GeneticBuilder:
 
         nodes = 0
         backtracks = 0
+        best_changed_seen = 0
 
         path_limit = max(
             1,
@@ -1052,10 +994,7 @@ class GeneticBuilder:
             ),
         )
 
-        while (
-            stack
-            and nodes < MAX_SEARCH_NODES
-        ):
+        while stack and nodes < node_limit:
             self._check_cancelled()
 
             state = next(
@@ -1083,8 +1022,11 @@ class GeneticBuilder:
 
             seen.add(cells)
 
-            changed = len(
-                parent ^ cells
+            changed = len(parent ^ cells)
+
+            best_changed_seen = max(
+                best_changed_seen,
+                changed,
             )
 
             if (
@@ -1117,44 +1059,47 @@ class GeneticBuilder:
                 if len(stack) > BACKTRACK_DEPTH:
                     del stack[0]
 
-        self.last_stats = {
-            "status": (
+        self.last_stats = dict(
+            status=(
                 "changed"
                 if best is not None
                 else "no_feasible_mutation"
             ),
-            "changed_cell_count": (
+            changed_cell_count=(
                 len(parent ^ best[0])
                 if best is not None
                 else 0
             ),
-            "minimum": minimum,
-            "maximum": maximum,
-            "target": target,
+            minimum=minimum,
+            maximum=maximum,
+            target=target,
 
-            "addition_azimuth_deg": (
+            addition_azimuth_deg=(
                 plan.azimuth_deg % 360
             ),
-            "removal_azimuth_deg": (
+            removal_azimuth_deg=(
                 (plan.azimuth_deg + 180) % 360
             ),
 
-            "direction_vector": vector,
-            "strip_center_cells": center,
-            "strip_half_width_cells": width,
+            direction_vector=vector,
+            strip_center_cells=center,
+            strip_half_width_cells=width,
 
-            "search_nodes": nodes,
-            "backtracks": backtracks,
-            "rejections": dict(rejected),
+            search_nodes=nodes,
+            search_node_limit=node_limit,
+            best_changed_seen=best_changed_seen,
+            backtracks=backtracks,
 
-            "cell_count": len(parent),
-            "boundary_shift_cells": (
+            rejections=dict(rejected),
+            cell_count=len(parent),
+
+            boundary_shift_cells=(
                 self.boundary_shift(parent)
             ),
-            "centroid_shift_cells": (
+            centroid_shift_cells=(
                 self.centroid_shift(parent)
             ),
-        }
+        )
 
         if best is None:
             return parent

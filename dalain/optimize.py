@@ -1,11 +1,13 @@
+"""Последовательная оценка CWEF и эволюция с переменным числом потомков."""
+
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import csv
 import hashlib
 import json
 import math
-from pathlib import Path
 import random
 import shutil
 import time
@@ -15,8 +17,8 @@ import numpy as np
 from loguru import logger
 
 from shapely.geometry import (
-    LineString,
     Point,
+    LineString,
     mapping,
 )
 
@@ -45,9 +47,7 @@ from .parallel_mutations import (
 )
 
 
-# ============================================================
-# РЕЗУЛЬТАТ ОЦЕНКИ
-# ============================================================
+MAX_EMPTY_GENERATIONS = 3
 
 
 @dataclass
@@ -59,8 +59,7 @@ class Evaluation:
     def mean_cwef(self):
         if not self.metrics:
             raise ValueError(
-                "Нельзя вычислить среднее CWEF: "
-                "нет расчётных точек"
+                "Нет расчётных точек"
             )
 
         return float(
@@ -72,23 +71,17 @@ class Evaluation:
 
 
 def mean_normal_cwef(result, baseline):
-    """Среднее по точкам от среднего дневного нормального CWEF."""
     return result.mean_cwef
 
 
-# ============================================================
-# СЛУЖЕБНЫЕ ФУНКЦИИ
-# ============================================================
-
-
 def shape_id(cells):
-    encoded = json.dumps(
+    data = json.dumps(
         sorted(cells),
         separators=(",", ":"),
-    ).encode("utf-8")
+    ).encode()
 
     return hashlib.sha256(
-        encoded
+        data
     ).hexdigest()[:20]
 
 
@@ -106,8 +99,8 @@ def json_default(value):
         return sorted(value)
 
     raise TypeError(
-        f"Объект {type(value).__name__} "
-        "не поддерживает сериализацию JSON"
+        "Не поддерживается JSON: "
+        f"{type(value).__name__}"
     )
 
 
@@ -131,8 +124,7 @@ def write_json(path, content):
 
 
 def operator_settings():
-    """Снимок явных констант текущего anchored.py."""
-    allowed_types = (
+    types = (
         str,
         int,
         float,
@@ -144,10 +136,10 @@ def operator_settings():
     )
 
     return {
-        name: value
-        for name, value in vars(mutation_module).items()
-        if name.isupper()
-        and isinstance(value, allowed_types)
+        key: value
+        for key, value in vars(mutation_module).items()
+        if key.isupper()
+        and isinstance(value, types)
     }
 
 
@@ -160,10 +152,11 @@ def normalize_paths(cfg):
 
         path = Path(value).expanduser()
 
-        if not path.is_absolute():
-            path = root / path
-
-        return path.resolve()
+        return (
+            path
+            if path.is_absolute()
+            else root / path
+        ).resolve()
 
     names = (
         "coastline_path",
@@ -204,39 +197,33 @@ def validate_population_candidate(
     parent,
     candidate,
 ):
-    """Проверка инвариантов после параллельной генерации."""
     if len(candidate) != len(parent):
         raise InvalidScenarioError(
-            "Изменилось количество квадратов: "
-            f"{len(parent)} -> {len(candidate)}"
+            "Изменилось количество клеток"
         )
 
     if geometry.anchor_cell not in candidate:
         raise InvalidScenarioError(
-            "Кандидат потерял якорную ячейку"
+            "Потеряна якорная клетка"
         )
 
-    changed_count = len(
+    changed = len(
         parent ^ candidate
     )
 
-    limit = builder.change_limit(parent)
-
-    if changed_count > limit:
+    if changed and not (
+        builder.minimum_change(parent)
+        <= changed
+        <= builder.change_limit(parent)
+    ):
         raise InvalidScenarioError(
-            "Превышен предел итогового изменения: "
-            f"{changed_count} > {limit}"
+            "Изменение вне допустимого диапазона"
         )
 
     if not geometry.valid(candidate):
         raise InvalidScenarioError(
-            "Кандидат не прошёл геометрическую проверку"
+            "Недопустимая геометрия"
         )
-
-
-# ============================================================
-# ПОСЛЕДОВАТЕЛЬНАЯ ОЦЕНКА CWEF
-# ============================================================
 
 
 class Evaluator:
@@ -269,17 +256,12 @@ class Evaluator:
             )
 
         logger.info(
-            "{} | квадратов={} | площадь={:.1f} м² | "
-            "исходных точек={} | новых={} | всего={}",
+            "{} | клеток={} | площадь={:.1f} м² | точек={}",
             label,
             len(cells),
             scenario.credited_area_m2,
-            scenario.original_point_count,
-            scenario.reclamation_point_count,
             len(scenario.sites),
         )
-
-        metrics = []
 
         progress = Progress(
             f"{label}: CWEF",
@@ -287,6 +269,8 @@ class Evaluator:
             self.cfg.progress_interval_s,
             self.cfg.point_log_every,
         )
+
+        metrics = []
 
         for index, site in enumerate(
             scenario.sites,
@@ -303,12 +287,6 @@ class Evaluator:
                 index,
                 "последний mean CWEF="
                 f"{metrics[-1]['mean_CWEF_Wm']:.6f} Вт/м",
-            )
-
-        if len(metrics) != len(scenario.sites):
-            raise RuntimeError(
-                "Число результатов не совпадает "
-                "с числом береговых точек"
             )
 
         result = Evaluation(
@@ -349,11 +327,6 @@ class Evaluator:
             )
 
 
-# ============================================================
-# СОХРАНЕНИЕ РЕШЕНИЙ
-# ============================================================
-
-
 class Recorder:
     def __init__(
         self,
@@ -380,22 +353,6 @@ class Recorder:
         ):
             (directory / name).mkdir()
 
-        self.history_handle = (
-            directory / "history.csv"
-        ).open(
-            "w",
-            encoding="utf-8",
-            newline="",
-        )
-
-        self.accepted_handle = (
-            directory / "accepted.csv"
-        ).open(
-            "w",
-            encoding="utf-8",
-            newline="",
-        )
-
         self.columns = [
             "solution_id",
             "parent_solution_id",
@@ -419,29 +376,48 @@ class Recorder:
             "file",
         ]
 
+        self.accepted_columns = [
+            "accepted_step",
+            "solution_id",
+            "parent_solution_id",
+            "epoch",
+            "generation",
+            "score",
+            "mean_CWEF_Wm",
+            "area_m2",
+            "removed_cell_count",
+            "added_cell_count",
+            "changed_cell_count",
+            "file",
+        ]
+
+        self.history_handle = (
+            directory / "history.csv"
+        ).open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        )
+
+        self.accepted_handle = (
+            directory / "accepted.csv"
+        ).open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        )
+
         self.history_writer = csv.DictWriter(
             self.history_handle,
             fieldnames=self.columns,
         )
-        self.history_writer.writeheader()
 
         self.accepted_writer = csv.DictWriter(
             self.accepted_handle,
-            fieldnames=[
-                "accepted_step",
-                "solution_id",
-                "parent_solution_id",
-                "epoch",
-                "generation",
-                "score",
-                "mean_CWEF_Wm",
-                "area_m2",
-                "removed_cell_count",
-                "added_cell_count",
-                "changed_cell_count",
-                "file",
-            ],
+            fieldnames=self.accepted_columns,
         )
+
+        self.history_writer.writeheader()
         self.accepted_writer.writeheader()
 
     def close(self):
@@ -460,96 +436,115 @@ class Recorder:
         cached=False,
         mutation_info=None,
     ):
+        geometry = self.geometry
         scenario = result.scenario
 
         solution_id = (
             f"solution_{self.sequence:08d}"
         )
 
-        if parent_cells is None:
-            removed = frozenset()
-            added = frozenset()
-        else:
-            removed = (
-                parent_cells - scenario.cells
-            )
-            added = (
-                scenario.cells - parent_cells
-            )
+        removed = (
+            frozenset()
+            if parent_cells is None
+            else parent_cells - scenario.cells
+        )
+
+        added = (
+            frozenset()
+            if parent_cells is None
+            else scenario.cells - parent_cells
+        )
+
+        context = dict(
+            solution_id=solution_id,
+            parent_solution_id=parent_solution_id,
+            epoch=epoch,
+            generation=generation,
+            individual=individual,
+        )
+
+        features = []
+
+        def add(shape, properties):
+            if not shape.is_empty:
+                features.append(
+                    dict(
+                        type="Feature",
+                        geometry=mapping(
+                            geometry.wgs84(shape)
+                        ),
+                        properties={
+                            **context,
+                            **properties,
+                        },
+                    )
+                )
 
         anchor_inside = bool(
             scenario.cells
             and scenario.fill.contains(
-                self.geometry.anchor_point
+                geometry.anchor_point
             )
         )
 
-        context = {
-            "solution_id": solution_id,
-            "parent_solution_id": parent_solution_id,
-            "epoch": epoch,
-            "generation": generation,
-            "individual": individual,
-        }
-
-        features = []
-
-        def add(geometry, properties):
-            if geometry.is_empty:
-                return
-
-            features.append({
-                "type": "Feature",
-                "geometry": mapping(
-                    self.geometry.wgs84(geometry)
-                ),
-                "properties": {
-                    **context,
-                    **properties,
-                },
-            })
-
         add(
-            self.geometry.anchor_point,
-            {
-                "kind": "anchor",
-                "inside_reclamation": anchor_inside,
-            },
+            geometry.anchor_point,
+            dict(
+                kind="anchor",
+                inside_reclamation=anchor_inside,
+            ),
         )
 
         for cell in sorted(scenario.cells):
             add(
-                self.geometry.cells[cell],
-                {
-                    "kind": "cell",
-                    "i": cell[0],
-                    "j": cell[1],
-                    "is_anchor_cell": (
-                        cell == self.geometry.anchor_cell
+                geometry.cells[cell],
+                dict(
+                    kind="cell",
+                    i=cell[0],
+                    j=cell[1],
+                    area_units=geometry.units[cell],
+                    is_anchor_cell=(
+                        cell == geometry.anchor_cell
                     ),
-                    "area_units": (
-                        self.geometry.units[cell]
-                    ),
-                    "is_added": cell in added,
-                },
+                    is_added=cell in added,
+                ),
+            )
+
+        for cell in sorted(removed):
+            add(
+                geometry.cells[cell],
+                dict(
+                    kind="removed_cell",
+                    i=cell[0],
+                    j=cell[1],
+                ),
             )
 
         add(
             scenario.fill,
-            {"kind": "reclamation"},
+            dict(kind="reclamation"),
         )
 
         add(
             scenario.coast,
-            {"kind": "coastline"},
+            dict(kind="coastline"),
         )
 
-        normal_length = min(
+        length = min(
             self.cfg.cell_side_m,
             self.cfg.point_spacing_m * 0.4,
         )
 
-        for point_id, (site, metrics) in enumerate(
+        if (
+            len(scenario.sites)
+            != len(result.metrics)
+        ):
+            raise RuntimeError(
+                "Число точек не совпадает "
+                "с числом результатов CWEF"
+            )
+
+        for index, (site, metrics) in enumerate(
             zip(
                 scenario.sites,
                 result.metrics,
@@ -557,37 +552,34 @@ class Recorder:
         ):
             add(
                 Point(site.x, site.y),
-                {
-                    "kind": "wave_point",
-                    "point_id": point_id,
-                    "normal_azimuth_deg": (
-                        site.normal_deg
-                    ),
+                dict(
+                    kind="wave_point",
+                    point_id=index,
+                    normal_azimuth_deg=site.normal_deg,
                     **metrics,
-                },
+                ),
             )
 
             add(
                 LineString([
                     (site.x, site.y),
                     (
-                        site.x + site.nx * normal_length,
-                        site.y + site.ny * normal_length,
+                        site.x + site.nx * length,
+                        site.y + site.ny * length,
                     ),
                 ]),
-                {
-                    "kind": "normal",
-                    "point_id": point_id,
-                },
+                dict(
+                    kind="normal",
+                    point_id=index,
+                ),
             )
 
-        mutation_info = mutation_info or {}
+        info = mutation_info or {}
 
         metadata = {
             **context,
-            "shape_id": shape_id(
-                scenario.cells
-            ),
+
+            "shape_id": shape_id(scenario.cells),
             "objective": self.objective,
             "score": float(score),
             "mean_CWEF_Wm": result.mean_cwef,
@@ -609,9 +601,7 @@ class Recorder:
             "reclamation_point_count": (
                 scenario.reclamation_point_count
             ),
-            "coast_length_m": (
-                scenario.coast.length
-            ),
+            "coast_length_m": scenario.coast.length,
 
             "removed_cell_count": len(removed),
             "added_cell_count": len(added),
@@ -623,20 +613,16 @@ class Recorder:
             "is_accepted": False,
             "cached": bool(cached),
 
-            "mutation_seed": mutation_info.get(
-                "seed"
-            ),
-            "mutation_seconds": mutation_info.get(
+            "mutation_seed": info.get("seed"),
+            "mutation_seconds": info.get(
                 "seconds",
                 0.0,
             ),
-            "mutation_stats": mutation_info.get(
+            "mutation_stats": info.get(
                 "stats",
                 {},
             ),
-            "mutation_error": mutation_info.get(
-                "error"
-            ),
+            "mutation_error": info.get("error"),
         }
 
         path = (
@@ -647,11 +633,11 @@ class Recorder:
 
         write_json(
             path,
-            {
-                "type": "FeatureCollection",
-                "metadata": metadata,
-                "features": features,
-            },
+            dict(
+                type="FeatureCollection",
+                metadata=metadata,
+                features=features,
+            ),
         )
 
         self.history_writer.writerow({
@@ -677,9 +663,9 @@ class Recorder:
 
         metadata = content["metadata"]
 
-        metadata["is_accepted"] = True
-        metadata["accepted_step"] = (
-            self.accepted_count
+        metadata.update(
+            is_accepted=True,
+            accepted_step=self.accepted_count,
         )
 
         write_json(
@@ -687,32 +673,19 @@ class Recorder:
             content,
         )
 
-        # Атомарная публикация лучшего решения.
         write_json(
             self.directory / "best.geojson",
             content,
         )
 
+        row = {
+            key: metadata[key]
+            for key in self.accepted_columns
+            if key != "file"
+        }
+
         self.accepted_writer.writerow({
-            "accepted_step": self.accepted_count,
-            "solution_id": metadata["solution_id"],
-            "parent_solution_id": (
-                metadata["parent_solution_id"]
-            ),
-            "epoch": metadata["epoch"],
-            "generation": metadata["generation"],
-            "score": metadata["score"],
-            "mean_CWEF_Wm": metadata["mean_CWEF_Wm"],
-            "area_m2": metadata["area_m2"],
-            "removed_cell_count": (
-                metadata["removed_cell_count"]
-            ),
-            "added_cell_count": (
-                metadata["added_cell_count"]
-            ),
-            "changed_cell_count": (
-                metadata["changed_cell_count"]
-            ),
+            **row,
             "file": path.name,
         })
 
@@ -727,25 +700,23 @@ class Recorder:
         generation,
         individual,
     ):
-        features = []
-
-        for cell in sorted(cells):
-            if cell not in self.geometry.cells:
-                continue
-
-            features.append({
-                "type": "Feature",
-                "geometry": mapping(
+        features = [
+            dict(
+                type="Feature",
+                geometry=mapping(
                     self.geometry.wgs84(
                         self.geometry.cells[cell]
                     )
                 ),
-                "properties": {
-                    "kind": "rejected_cell",
-                    "i": cell[0],
-                    "j": cell[1],
-                },
-            })
+                properties=dict(
+                    kind="rejected_cell",
+                    i=cell[0],
+                    j=cell[1],
+                ),
+            )
+            for cell in sorted(cells)
+            if cell in self.geometry.cells
+        ]
 
         path = (
             self.directory
@@ -755,16 +726,16 @@ class Recorder:
 
         write_json(
             path,
-            {
-                "type": "FeatureCollection",
-                "metadata": {
-                    "epoch": epoch,
-                    "generation": generation,
-                    "individual": individual,
-                    "reason": str(reason),
-                },
-                "features": features,
-            },
+            dict(
+                type="FeatureCollection",
+                features=features,
+                metadata=dict(
+                    epoch=epoch,
+                    generation=generation,
+                    individual=individual,
+                    reason=str(reason),
+                ),
+            ),
         )
 
         self.rejected_count += 1
@@ -784,6 +755,18 @@ class Recorder:
         mutation_pool,
         elapsed_seconds,
     ):
+        def describe(row):
+            return dict(
+                index=row.index,
+                seed=row.seed,
+                seconds=row.seconds,
+                changed_cell_count=len(
+                    parent_cells ^ row.cells
+                ),
+                stats=row.stats,
+                error=row.error,
+            )
+
         path = (
             self.directory
             / "mutation_batches"
@@ -795,30 +778,26 @@ class Recorder:
 
         write_json(
             path,
-            {
-                "epoch": epoch,
-                "generation": generation,
-                "parent_solution_id": (
-                    parent_solution_id
-                ),
-                "backend": mutation_pool.backend,
-                "workers": mutation_pool.workers,
-                "elapsed_seconds": elapsed_seconds,
-                "tasks": [
-                    {
-                        # Нулевая особь — сохранённый родитель.
-                        "individual": result.index + 1,
-                        "seed": result.seed,
-                        "seconds": result.seconds,
-                        "changed_cell_count": len(
-                            parent_cells ^ result.cells
-                        ),
-                        "stats": result.stats,
-                        "error": result.error,
-                    }
-                    for result in mutation_pool.last_results
+            dict(
+                epoch=epoch,
+                generation=generation,
+                parent_solution_id=parent_solution_id,
+                backend=mutation_pool.backend,
+                workers=mutation_pool.workers,
+                elapsed_seconds=elapsed_seconds,
+
+                sampling=mutation_pool.last_stats,
+
+                tasks=[
+                    describe(row)
+                    for row in mutation_pool.last_results
                 ],
-            },
+
+                attempts=[
+                    describe(row)
+                    for row in mutation_pool.last_attempts
+                ],
+            ),
         )
 
     def frame(
@@ -828,6 +807,7 @@ class Recorder:
         generation,
         history,
         color_max,
+        parent_cells=None,
     ):
         import matplotlib
 
@@ -837,142 +817,156 @@ class Recorder:
 
         scenario = result.scenario
 
-        figure = plt.figure(
+        figure, (axis, curve) = plt.subplots(
+            2,
+            1,
             figsize=(
                 self.cfg.figure_width / 100,
                 self.cfg.figure_height / 100,
             ),
+            gridspec_kw={
+                "height_ratios": [5, 1]
+            },
             dpi=100,
         )
 
-        axis = figure.add_axes(
-            [0.09, 0.29, 0.80, 0.63]
-        )
-        axis.set_aspect("equal")
-        axis.set_facecolor("#e4f0f6")
+        try:
+            axis.set_aspect("equal")
+            axis.set_facecolor("#e4f0f6")
 
-        radius = (
-            self.cfg.evaluation_radius_m
-            + self.cfg.cell_side_m
-        )
+            radius = (
+                self.cfg.evaluation_radius_m
+                + self.cfg.cell_side_m
+            )
 
-        view = Point(0, 0).buffer(radius)
+            view = Point(0, 0).buffer(
+                radius
+            )
 
-        for line in geometry_parts(
-            self.geometry.original_coast.intersection(
-                view
-            ),
-            {"LineString"},
-        ):
+            for line in geometry_parts(
+                self.geometry.original_coast.intersection(
+                    view
+                ),
+                {"LineString"},
+            ):
+                axis.plot(
+                    *line.xy,
+                    color="#999999",
+                    linewidth=0.7,
+                )
+
+            added = (
+                frozenset()
+                if parent_cells is None
+                else scenario.cells - parent_cells
+            )
+
+            removed = (
+                frozenset()
+                if parent_cells is None
+                else parent_cells - scenario.cells
+            )
+
+            for cell in sorted(scenario.cells):
+                axis.fill(
+                    *self.geometry.cells[cell].exterior.xy,
+                    facecolor=(
+                        "#4cab65"
+                        if cell in added
+                        else "#ed974c"
+                    ),
+                    edgecolor="white",
+                    linewidth=0.3,
+                )
+
+            for cell in sorted(removed):
+                axis.plot(
+                    *self.geometry.cells[cell].exterior.xy,
+                    color="#c43c39",
+                    linewidth=0.6,
+                )
+
+            for line in geometry_parts(
+                scenario.coast,
+                {"LineString"},
+            ):
+                axis.plot(
+                    *line.xy,
+                    color="#263a47",
+                    linewidth=0.8,
+                )
+
+            scatter = axis.scatter(
+                [site.x for site in scenario.sites],
+                [site.y for site in scenario.sites],
+                c=[
+                    row["mean_CWEF_Wm"]
+                    for row in result.metrics
+                ],
+                s=12,
+                cmap="viridis",
+                vmin=0,
+                vmax=max(1, color_max),
+            )
+
+            figure.colorbar(
+                scatter,
+                ax=axis,
+                label="Mean normal CWEF, W/m",
+                fraction=0.035,
+            )
+
             axis.plot(
-                *line.xy,
-                color="#999999",
+                *self.geometry.roi.exterior.xy,
+                "--",
+                color="#7b8b95",
                 linewidth=0.7,
             )
 
-        for cell in sorted(scenario.cells):
-            axis.fill(
-                *self.geometry.cells[cell].exterior.xy,
-                facecolor="#ed974c",
-                edgecolor="white",
-                linewidth=0.4,
-            )
-
-        for line in geometry_parts(
-            scenario.coast,
-            {"LineString"},
-        ):
             axis.plot(
-                *line.xy,
-                color="#263a47",
-                linewidth=0.8,
+                0,
+                0,
+                marker="*",
+                color="red",
+                markersize=10,
             )
 
-        scatter = axis.scatter(
-            [
-                site.x
-                for site in scenario.sites
-            ],
-            [
-                site.y
-                for site in scenario.sites
-            ],
-            c=[
-                row["mean_CWEF_Wm"]
-                for row in result.metrics
-            ],
-            s=12,
-            cmap="viridis",
-            vmin=0,
-            vmax=max(1, color_max),
-        )
-
-        figure.colorbar(
-            scatter,
-            ax=axis,
-            label="Mean normal CWEF, W/m",
-            fraction=0.035,
-        )
-
-        axis.plot(
-            *self.geometry.roi.exterior.xy,
-            "--",
-            color="#7b8b95",
-            linewidth=0.7,
-        )
-
-        axis.plot(
-            0,
-            0,
-            marker="*",
-            color="red",
-            markersize=10,
-        )
-
-        axis.set_xlim(-radius, radius)
-        axis.set_ylim(-radius, radius)
-        axis.set_xlabel("Local east, m")
-        axis.set_ylabel("Local north, m")
-
-        label = (
-            "Initial anchored solution"
-            if generation < 0
-            else (
-                f"Epoch {epoch + 1}/{self.cfg.epochs}, "
-                f"generation {generation + 1}/"
-                f"{self.cfg.generations}"
+            axis.set(
+                xlim=(-radius, radius),
+                ylim=(-radius, radius),
+                xlabel="Local east, m",
+                ylabel="Local north, m",
+                title=(
+                    f"Accepted | epoch={epoch + 1}, "
+                    f"generation={generation + 1} | "
+                    f"CWEF={result.mean_cwef:.6f} W/m"
+                ),
             )
-        )
 
-        axis.set_title(
-            f"{label}\n"
-            f"Accepted mean normal CWEF = "
-            f"{result.mean_cwef:.6g} W/m; "
-            f"N = {len(scenario.cells)}"
-        )
+            curve.plot(
+                history,
+                color="#bf571b",
+            )
 
-        curve = figure.add_axes(
-            [0.12, 0.08, 0.75, 0.12]
-        )
+            curve.set(
+                xlabel="Generation",
+                ylabel="Accepted objective",
+            )
 
-        curve.plot(
-            history,
-            color="#bf571b",
-        )
-        curve.set_xlabel(
-            "Initial solution and generation frames"
-        )
-        curve.set_ylabel("Accepted objective")
-        curve.grid(alpha=0.25)
+            curve.grid(alpha=0.25)
 
-        figure.savefig(
-            self.directory
-            / "frames"
-            / f"frame_{self.frame_count:06d}.png"
-        )
+            figure.tight_layout()
 
-        plt.close(figure)
-        self.frame_count += 1
+            figure.savefig(
+                self.directory
+                / "frames"
+                / f"frame_{self.frame_count:06d}.png"
+            )
+
+            self.frame_count += 1
+
+        finally:
+            plt.close(figure)
 
     def animate(self):
         from PIL import Image
@@ -987,25 +981,12 @@ class Recorder:
             return
 
         def remaining():
-            for index, path in enumerate(
-                paths[1:],
-                2,
-            ):
+            for path in paths[1:]:
                 with Image.open(path) as image:
                     yield image.convert("RGB")
 
-                if (
-                    index % 10 == 0
-                    or index == len(paths)
-                ):
-                    logger.info(
-                        "GIF | {}/{} кадров",
-                        index,
-                        len(paths),
-                    )
-
-        with Image.open(paths[0]) as first:
-            first.convert("RGB").save(
+        with Image.open(paths[0]) as image:
+            image.convert("RGB").save(
                 self.directory / "evolution.gif",
                 save_all=True,
                 append_images=remaining(),
@@ -1014,11 +995,6 @@ class Recorder:
                 ),
                 loop=0,
             )
-
-
-# ============================================================
-# ОСНОВНОЙ ЗАПУСК
-# ============================================================
 
 
 def run(cfg, objective=mean_normal_cwef):
@@ -1047,24 +1023,19 @@ def run(cfg, objective=mean_normal_cwef):
 
     started = time.perf_counter()
 
-    mutation_total_seconds = 0.0
-    evaluation_total_seconds = 0.0
-    frame_total_seconds = 0.0
+    mutation_seconds = 0.0
+    evaluation_seconds = 0.0
+
+    completed = 0
+    empty_generations = 0
+
+    stop_reason = "completed"
+    failed = False
 
     try:
         logger.info(
-            "DALAIN | параллельный поиск мутаций"
-        )
-
-        logger.info(
-            "Исходная точка: lon={}, lat={}",
-            cfg.center_lon,
-            cfg.center_lat,
-        )
-
-        logger.info(
-            "Критерий: среднее по береговым точкам "
-            "от среднего дневного нормального CWEF"
+            "DALAIN | переменное поколение "
+            "и параллельные мутации"
         )
 
         with stage(
@@ -1076,31 +1047,16 @@ def run(cfg, objective=mean_normal_cwef):
                 str(cfg.weather_path) + "-wal"
             )
 
-            if (
-                wal.exists()
-                and wal.stat().st_size
-            ):
+            if wal.exists() and wal.stat().st_size:
                 raise RuntimeError(
                     "Погодная БД содержит "
                     f"непогашенный WAL: {wal}"
                 )
 
-            import PIL
-
         with stage(
             "Геометрия и проверка якоря"
         ):
             geometry = AnchoredGeometry(cfg)
-
-        if not hasattr(
-            geometry,
-            "fixed_cell_count",
-        ):
-            raise RuntimeError(
-                "Требуется актуальный anchored.py "
-                "с поштучными переносами и "
-                "фиксированным количеством квадратов"
-            )
 
         from .bathymetry import prepare_bathymetry
 
@@ -1109,10 +1065,9 @@ def run(cfg, objective=mean_normal_cwef):
         ):
             cfg = prepare_bathymetry(cfg)
 
-        # Синхронизируем Config до создания snapshot workers.
         geometry.cfg = cfg
 
-        objective_name = getattr(
+        name = getattr(
             objective,
             "__name__",
             type(objective).__name__,
@@ -1122,16 +1077,16 @@ def run(cfg, objective=mean_normal_cwef):
             directory / "config.json",
             {
                 **asdict(cfg),
-                "objective": objective_name,
-                "evolution": {
-                    "mode": "anchored_1_plus_lambda",
-                    "anchor_cell": [0, 0],
-                    "random_epoch_restart": False,
-                    "whole_shape_translation": False,
-                    "operator_settings": (
-                        operator_settings()
+                "objective": name,
+                "evolution": dict(
+                    mode="anchored_1_plus_variable_lambda",
+                    operator_settings=operator_settings(),
+                    mutation_backend=MUTATION_BACKEND,
+                    mutation_workers=MUTATION_WORKERS,
+                    max_empty_generations=(
+                        MAX_EMPTY_GENERATIONS
                     ),
-                },
+                ),
             },
         )
 
@@ -1156,18 +1111,18 @@ def run(cfg, objective=mean_normal_cwef):
             cfg,
             geometry,
             directory,
-            objective_name,
+            name,
         )
 
         with stage(
             "Исходный берег без намыва"
         ):
-            evaluator.baseline = evaluator.calculate(
+            baseline = evaluator.calculate(
                 frozenset(),
                 "Исходный берег",
             )
 
-        baseline = evaluator.baseline
+            evaluator.baseline = baseline
 
         recorder.save(
             baseline,
@@ -1194,26 +1149,13 @@ def run(cfg, objective=mean_normal_cwef):
         with stage(
             "Построение первого якорного намыва"
         ):
-            parent_cells = builder.initial()
-
-        fixed_cell_count = len(
-            parent_cells
-        )
-
-        if (
-            geometry.fixed_cell_count
-            != fixed_cell_count
-        ):
-            raise RuntimeError(
-                "Первый намыв не зафиксировал "
-                "количество квадратов"
-            )
+            parent = builder.initial()
 
         with stage(
             "Оценка первого якорного намыва"
         ):
             parent_result = evaluator.evaluate(
-                parent_cells,
+                parent,
                 "Первый якорный намыв",
             )
 
@@ -1241,7 +1183,11 @@ def run(cfg, objective=mean_normal_cwef):
 
         color_max = max(
             row["mean_CWEF_Wm"]
-            for row in baseline.metrics
+            for result in (
+                baseline,
+                parent_result,
+            )
+            for row in result.metrics
         )
 
         recorder.frame(
@@ -1252,187 +1198,140 @@ def run(cfg, objective=mean_normal_cwef):
             color_max,
         )
 
-        # Не создаём больше workers, чем независимых
-        # вариантов в одном поколении.
-        actual_workers = min(
-            MUTATION_WORKERS,
-            max(
-                1,
-                cfg.population_size - 1,
-            ),
+        donor_pool = [parent]
+        donor_scores = [parent_score]
+
+        mutation_pool = ParallelMutationPool(
+            builder,
+            backend=MUTATION_BACKEND,
+            workers=MUTATION_WORKERS,
         )
 
-        with stage(
-            "Инициализация постоянного пула мутаций"
-        ):
-            mutation_pool = ParallelMutationPool(
-                builder,
-                backend=MUTATION_BACKEND,
-                workers=actual_workers,
-            )
-
-        write_json(
-            directory / "parallelism.json",
-            {
-                "mutation_backend": (
-                    mutation_pool.backend
-                ),
-                "mutation_workers": (
-                    mutation_pool.workers
-                ),
-                "parallel_cwef": False,
-                "population_order_preserved": True,
-                "worker_writes_geojson": False,
-            },
-        )
-
-        donor_pool = [
-            parent_cells
-        ]
-        donor_scores = [
-            parent_score
-        ]
-
-        def choose_donor():
-            indices = [
-                rng.randrange(
-                    len(donor_pool)
-                )
-                for _ in range(
-                    cfg.tournament_size
-                )
-            ]
-
-            index = min(
-                indices,
-                key=lambda i: donor_scores[i],
-            )
-
-            return donor_pool[index]
+        stop = False
 
         for epoch in range(cfg.epochs):
-            logger.info(
-                "ЭПОХА {}/{} | продолжение от {} | "
-                "score={:.6f}",
-                epoch + 1,
-                cfg.epochs,
-                parent_id,
-                parent_score,
-            )
-
-            for generation in range(
-                cfg.generations
-            ):
-                generation_started = (
-                    time.perf_counter()
-                )
-
-                # Один фиксированный родитель
-                # для всех вариантов поколения.
-                source_cells = parent_cells
-                source_result = parent_result
-                source_score = parent_score
+            for generation in range(cfg.generations):
+                source = parent
                 source_id = parent_id
+                source_score = parent_score
+                source_result = parent_result
 
-                mutation_started = (
-                    time.perf_counter()
-                )
+                def choose_donor():
+                    indices = [
+                        rng.randrange(
+                            len(donor_pool)
+                        )
+                        for _ in range(
+                            cfg.tournament_size
+                        )
+                    ]
+
+                    index = min(
+                        indices,
+                        key=lambda candidate: (
+                            donor_scores[candidate]
+                        ),
+                    )
+
+                    return donor_pool[index]
+
+                donors = [
+                    choose_donor()
+                    for _ in range(
+                        cfg.population_size - 1
+                    )
+                ]
+
+                seeds = [
+                    rng.getrandbits(64)
+                    for _ in donors
+                ]
+
+                step_started = time.perf_counter()
 
                 with stage(
                     "Параллельные варианты принятого решения"
                 ):
-                    # Всё случайное состояние задач
-                    # задаётся в главном процессе.
-                    jobs = [
-                        (
-                            choose_donor(),
-                            rng.getrandbits(64),
-                        )
-                        for _ in range(
-                            cfg.population_size - 1
-                        )
-                    ]
-
-                    donors = [
-                        donor
-                        for donor, seed in jobs
-                    ]
-
-                    seeds = [
-                        seed
-                        for donor, seed in jobs
-                    ]
-
                     variants = mutation_pool.generate(
-                        parent=source_cells,
-                        donors=donors,
-                        seeds=seeds,
+                        source,
+                        donors,
+                        seeds,
                         label=(
                             f"Э{epoch + 1}/"
                             f"П{generation + 1}: мутации"
                         ),
                     )
 
-                    population = [
-                        source_cells,
-                        *variants,
-                    ]
-
-                mutation_seconds = (
+                elapsed = (
                     time.perf_counter()
-                    - mutation_started
+                    - step_started
                 )
 
-                mutation_total_seconds += (
-                    mutation_seconds
-                )
+                mutation_seconds += elapsed
 
                 recorder.save_mutation_batch(
-                    epoch=epoch,
-                    generation=generation,
-                    parent_solution_id=source_id,
-                    parent_cells=source_cells,
-                    mutation_pool=mutation_pool,
-                    elapsed_seconds=mutation_seconds,
+                    epoch,
+                    generation,
+                    source_id,
+                    source,
+                    mutation_pool,
+                    elapsed,
                 )
 
                 if (
-                    len(population)
-                    != cfg.population_size
+                    len(variants)
+                    > cfg.population_size - 1
+                    or len(variants)
+                    != len(mutation_pool.last_results)
                 ):
                     raise RuntimeError(
-                        "Пул вернул неверный размер популяции"
+                        "Пул вернул несогласованные "
+                        "размеры результатов"
                     )
 
-                # Порядок worker-результатов соответствует
-                # порядку variants, а не времени завершения.
-                mutation_infos = [
-                    None,
-                    *[
-                        {
-                            "seed": result.seed,
-                            "seconds": result.seconds,
-                            "stats": result.stats,
-                            "error": result.error,
-                        }
-                        for result in mutation_pool.last_results
-                    ],
-                ]
+                if (
+                    source in variants
+                    or len(set(variants))
+                    != len(variants)
+                ):
+                    raise RuntimeError(
+                        "Пул вернул копии родителя "
+                        "или дубликаты"
+                    )
 
-                winner_cells = source_cells
-                winner_result = source_result
-                winner_score = source_score
-                winner_path = None
-                winner_id = source_id
-
-                scores = []
-
-                evaluation_started = (
-                    time.perf_counter()
+                logger.info(
+                    "ПОПУЛЯЦИЯ | родитель=1 | новых={} | "
+                    "всего={}/{}",
+                    len(variants),
+                    1 + len(variants),
+                    cfg.population_size,
                 )
 
-                for individual, cells in enumerate(
-                    population
+                empty_generations = (
+                    empty_generations + 1
+                    if not variants
+                    else 0
+                )
+
+                next_donors = [source]
+                next_scores = [source_score]
+
+                winner = (
+                    source,
+                    source_result,
+                    source_score,
+                    parent_path,
+                    source_id,
+                )
+
+                step_started = time.perf_counter()
+
+                for individual, (cells, info) in enumerate(
+                    zip(
+                        variants,
+                        mutation_pool.last_results,
+                    ),
+                    1,
                 ):
                     label = (
                         f"Э{epoch + 1}/"
@@ -1440,31 +1339,22 @@ def run(cfg, objective=mean_normal_cwef):
                         f"О{individual + 1}"
                     )
 
-                    mutation_info = (
-                        mutation_infos[individual]
-                    )
-
-                    cached = (
-                        evaluator.cache.contains(cells)
+                    cached = evaluator.cache.contains(
+                        cells
                     )
 
                     try:
                         validate_population_candidate(
                             geometry,
                             builder,
-                            source_cells,
+                            source,
                             cells,
                         )
 
-                        if cells == source_cells:
-                            # Родитель уже рассчитан.
-                            result = source_result
-                            cached = True
-                        else:
-                            result = evaluator.evaluate(
-                                cells,
-                                label,
-                            )
+                        result = evaluator.evaluate(
+                            cells,
+                            label,
+                        )
 
                     except InvalidScenarioError as error:
                         recorder.reject(
@@ -1474,16 +1364,7 @@ def run(cfg, objective=mean_normal_cwef):
                             generation,
                             individual,
                         )
-
-                        cells = source_cells
-                        population[individual] = cells
-                        result = source_result
-                        cached = True
-
-                        mutation_info = dict(
-                            mutation_info or {}
-                        )
-                        mutation_info["error"] = str(error)
+                        continue
 
                     score = checked_score(
                         objective,
@@ -1492,209 +1373,142 @@ def run(cfg, objective=mean_normal_cwef):
                     )
 
                     path, solution_id = recorder.save(
-                        result=result,
-                        score=score,
-                        epoch=epoch,
-                        generation=generation,
-                        individual=individual,
-                        parent_cells=source_cells,
+                        result,
+                        score,
+                        epoch,
+                        generation,
+                        individual,
+                        parent_cells=source,
                         parent_solution_id=source_id,
                         cached=cached,
-                        mutation_info=mutation_info,
+                        mutation_info=dict(
+                            seed=info.seed,
+                            seconds=info.seconds,
+                            stats=info.stats,
+                            error=info.error,
+                        ),
                     )
 
-                    scores.append(score)
+                    next_donors.append(cells)
+                    next_scores.append(score)
 
                     logger.info(
-                        "{} | CWEF={:.6f} Вт/м | "
-                        "удалено={} | добавлено={} | "
-                        "N={} | кеш={}",
+                        "{} | score={:.6f} | "
+                        "удалено={} | добавлено={} | кеш={}",
                         label,
-                        result.mean_cwef,
-                        len(source_cells - cells),
-                        len(cells - source_cells),
-                        len(cells),
+                        score,
+                        len(source - cells),
+                        len(cells - source),
                         cached,
                     )
 
-                    # При равенстве критерия
-                    # сохраняется прежний родитель.
-                    if score < winner_score:
-                        winner_cells = cells
-                        winner_result = result
-                        winner_score = score
-                        winner_path = path
-                        winner_id = solution_id
+                    if score < winner[2]:
+                        winner = (
+                            cells,
+                            result,
+                            score,
+                            path,
+                            solution_id,
+                        )
 
-                evaluation_seconds = (
+                evaluation_seconds += (
                     time.perf_counter()
-                    - evaluation_started
+                    - step_started
                 )
 
-                evaluation_total_seconds += (
-                    evaluation_seconds
-                )
+                (
+                    parent,
+                    parent_result,
+                    parent_score,
+                    parent_path,
+                    parent_id,
+                ) = winner
 
-                if winner_path is not None:
+                if parent != source:
                     recorder.accept(
-                        winner_path
+                        parent_path
                     )
 
                     logger.success(
                         "ПРИНЯТО | {} -> {} | "
-                        "score {:.6f} -> {:.6f} | "
-                        "удалено={} | добавлено={}",
+                        "score {:.6f} -> {:.6f}",
                         source_id,
-                        winner_id,
+                        parent_id,
                         source_score,
-                        winner_score,
-                        len(source_cells - winner_cells),
-                        len(winner_cells - source_cells),
+                        parent_score,
                     )
 
                 else:
                     logger.info(
-                        "УЛУЧШЕНИЯ НЕТ | "
-                        "сохранён родитель {}",
-                        source_id,
+                        "Родитель сохранён: улучшения нет"
                     )
 
-                parent_cells = winner_cells
-                parent_result = winner_result
-                parent_score = winner_score
-                parent_id = winner_id
-
-                donor_pool = population
-                donor_scores = scores
+                donor_pool = next_donors
+                donor_scores = next_scores
 
                 history.append(
                     parent_score
                 )
 
-                frame_started = (
-                    time.perf_counter()
-                )
+                completed += 1
 
-                with stage(
-                    "Кадр принятой траектории"
-                ):
-                    recorder.frame(
-                        parent_result,
-                        epoch,
-                        generation,
-                        history,
-                        color_max,
-                    )
-
-                frame_seconds = (
-                    time.perf_counter()
-                    - frame_started
-                )
-
-                frame_total_seconds += (
-                    frame_seconds
-                )
-
-                unique_new = len(
-                    set(population)
-                    - {source_cells}
-                )
-
-                logger.info(
-                    "ИТОГ ПОКОЛЕНИЯ | "
-                    "родитель={} | score={:.6f} | "
-                    "новых уникальных вариантов={} | "
-                    "мутации={:.2f} с | "
-                    "оценка и экспорт={:.2f} с | "
-                    "кадр={:.2f} с | всего={:.2f} с",
-                    parent_id,
-                    parent_score,
-                    unique_new,
-                    mutation_seconds,
-                    evaluation_seconds,
-                    frame_seconds,
-                    time.perf_counter() - generation_started,
+                recorder.frame(
+                    parent_result,
+                    epoch,
+                    generation,
+                    history,
+                    color_max,
+                    parent_cells=source,
                 )
 
                 evaluator.log_cache()
 
-        with stage(
-            "Анимация принятой траектории"
-        ):
-            recorder.animate()
+                if (
+                    empty_generations
+                    >= MAX_EMPTY_GENERATIONS
+                ):
+                    stop_reason = "no_new_variants"
 
-        summary = {
-            "objective": objective_name,
+                    logger.warning(
+                        "{} поколений без новых форм; "
+                        "нормальное завершение поиска",
+                        empty_generations,
+                    )
 
-            "baseline_mean_CWEF_Wm": (
-                baseline.mean_cwef
-            ),
-            "best_mean_CWEF_Wm": (
-                parent_result.mean_cwef
-            ),
-            "best_score": parent_score,
-            "best_solution_id": parent_id,
+                    stop = True
+                    break
 
-            "anchor_lon": cfg.center_lon,
-            "anchor_lat": cfg.center_lat,
-            "anchor_inside": (
-                parent_result.scenario.fill.contains(
-                    geometry.anchor_point
-                )
-            ),
+            if stop:
+                break
 
-            "initial_target_area_m2": (
-                cfg.target_area_m2
-            ),
-            "best_credited_area_m2": (
+        recorder.animate()
+
+        summary = dict(
+            objective=name,
+            solution_id=parent_id,
+            shape_id=shape_id(parent),
+            score=parent_score,
+
+            mean_CWEF_Wm=parent_result.mean_cwef,
+            baseline_mean_CWEF_Wm=baseline.mean_cwef,
+
+            cell_count=len(parent),
+            area_m2=(
                 parent_result.scenario.credited_area_m2
             ),
-            "best_area_difference_m2": (
-                parent_result.scenario.credited_area_m2
-                - cfg.target_area_m2
-            ),
-            "fixed_cell_count": fixed_cell_count,
 
-            "solutions": recorder.sequence,
-            "accepted_solutions": (
-                recorder.accepted_count
-            ),
-            "rejected_scenarios": (
-                recorder.rejected_count
-            ),
-            "frames": recorder.frame_count,
+            completed_generations=completed,
+            stop_reason=stop_reason,
 
-            "mutation_backend": (
-                mutation_pool.backend
-            ),
-            "mutation_workers": (
-                mutation_pool.workers
-            ),
+            mutation_seconds=mutation_seconds,
+            evaluation_seconds=evaluation_seconds,
+            seconds=time.perf_counter() - started,
 
-            "mutation_total_seconds": (
-                mutation_total_seconds
-            ),
-            "evaluation_and_export_total_seconds": (
-                evaluation_total_seconds
-            ),
-            "frame_total_seconds": (
-                frame_total_seconds
-            ),
-            "elapsed_seconds": (
-                time.perf_counter() - started
-            ),
+            accepted_count=recorder.accepted_count,
+            rejected_count=recorder.rejected_count,
 
-            "relative_change_percent": (
-                100
-                * (
-                    parent_result.mean_cwef
-                    / baseline.mean_cwef
-                    - 1
-                )
-                if baseline.mean_cwef > 0
-                else None
-            ),
-        }
+            solution_file=parent_path.name,
+        )
 
         write_json(
             directory / "summary.json",
@@ -1702,38 +1516,31 @@ def run(cfg, objective=mean_normal_cwef):
         )
 
         logger.success(
-            "ЗАВЕРШЕНО | "
-            "решение={} | "
-            "CWEF={:.6f} Вт/м | "
-            "N={} | площадь={:.1f} м²",
+            "ЗАВЕРШЕНО | {} | score={:.6f} | {}",
             parent_id,
-            parent_result.mean_cwef,
-            len(parent_cells),
-            parent_result.scenario.credited_area_m2,
-        )
-
-        logger.success(
-            "Результаты: {}",
+            parent_score,
             directory,
         )
 
         return directory
 
     except BaseException:
+        failed = True
+
         logger.exception(
             "Расчёт прерван. "
             "Промежуточные результаты: {}",
             directory,
         )
+
         raise
 
     finally:
         try:
             if mutation_pool is not None:
-                logger.info(
-                    "Закрытие пула мутаций..."
+                mutation_pool.close(
+                    abort=failed
                 )
-                mutation_pool.close()
 
         finally:
             try:

@@ -46,7 +46,7 @@ class Config:
     cell_side_m: float = 25.0
 
     search_radius_m: float = 1_000.0
-    evaluation_radius_m: float = 1_500.0
+    evaluation_radius_m: float = 1_250.0
 
     connection: str = "attached"  # attached | island
     sea_side: str = "right"       # left | right

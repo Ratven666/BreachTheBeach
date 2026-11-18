@@ -77,7 +77,7 @@ DATABASE_PATH = Path(
 
 # Готовые точки: Point GeoJSON.
 POINTS_GEOJSON_PATH = Path(
-    "/Users/mihailvystrcil/Documents/My Programms/BreachTheBeach/big_scale/data/S2CoastRussiaCropped_points_10000_min_distance_5000m.geojson"
+    "/Users/mihailvystrcil/Documents/My Programms/BreachTheBeach/big_scale/data/S2CoastRussiaCropped_points_weather_covered_unique_min_distance_400m.geojson"
 )
 
 # Береговая линия: LineString / MultiLineString GeoJSON.

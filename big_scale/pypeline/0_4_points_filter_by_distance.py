@@ -36,7 +36,7 @@ from tqdm.auto import tqdm
 
 INPUT_FILE = Path(
     "/Users/mihailvystrcil/Documents/My Programms/"
-    "BreachTheBeach/big_scale/data/S2CoastRussiaCropped_points_10000.geojson"
+    "BreachTheBeach/big_scale/data/S2CoastRussiaCropped_points_weather_covered_unique.geojson"
 )
 
 # None — сохранить рядом с исходным файлом:
@@ -44,7 +44,7 @@ INPUT_FILE = Path(
 OUTPUT_FILE: Path | None = None
 
 # Минимально допустимое расстояние между точками, метры.
-MIN_DISTANCE_M = 5000.0
+MIN_DISTANCE_M = 400.0
 
 # Используется только при отсутствии CRS у исходного файла.
 # Задавай EPSG:4326 только если координаты действительно WGS84.

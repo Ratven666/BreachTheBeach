@@ -20,6 +20,7 @@ if __package__ in {None, ""}:
 
 from dalain import sequential as seq
 from dalain.optimize import Evaluation, json_default
+from dalain.parallel_evaluation import EvaluationPool
 from dalain.sequential_animation import animation
 
 
@@ -32,6 +33,8 @@ class RunOptions:
     objective_id: str = "mean_normal_cwef:v1"
     make_animation: bool = True
     render_only: bool = False
+    evaluation_workers: int = 1
+    detailed_worker_bathymetry: bool = False
 
 
 def dump(obj):
@@ -134,9 +137,11 @@ class Store:
 
 
 class Scorer:
-    def __init__(self, store, evaluator, geometry, objective):
+    def __init__(self, store, evaluator, geometry, objective, pool, detailed_bathymetry):
         self.store, self.evaluator, self.geometry = store, evaluator, geometry
         self.objective = objective
+        self.pool = pool
+        self.detailed_bathymetry = detailed_bathymetry
         self.hits = self.calculated = 0
         empty = frozenset()
         key = digest(empty)
@@ -149,6 +154,18 @@ class Scorer:
             self.baseline = Evaluation(geometry.scenario(empty), metrics)
         evaluator.baseline = self.baseline
 
+    @staticmethod
+    def label(current, key):
+        return f"CWEF {key[:8]} | клеток={len(current)}"
+
+    def prefetch(self, states):
+        keys = set()
+        for current in states:
+            key = digest(current)
+            if key not in keys and self.store.get_score(key) is None:
+                self.pool.submit(key, current, self.label(current, key))
+            keys.add(key)
+
     def score(self, current):
         key = digest(current)
         row = self.store.get_score(key)
@@ -156,7 +173,28 @@ class Scorer:
             self.hits += 1
             return row[0]  # NULL означает геометрически недопустимый вариант.
         try:
-            result = self.evaluator.evaluate(current, f"CWEF {key[:8]} | клеток={len(current)}")
+            metrics = self.pool.take(
+                key, lambda queued: logger.info(
+                    "Оценка CWEF {} | незавершённых задач={} | сохранено={} | кеш={}",
+                    key[:8], queued, self.calculated, self.hits,
+                ),
+                interval=max(0.1, self.evaluator.cfg.progress_interval_s),
+            )
+            if metrics is None:
+                result = self.evaluator.evaluate(current, self.label(current, key))
+            else:
+                # Штатной функции нужны только метрики; пользовательской может
+                # понадобиться геометрия с исходной точностью Shapely.
+                scenario = None if self.objective is seq.mean_normal_cwef else self.geometry.scenario(current)
+                result = Evaluation(scenario, metrics)
+                if not self.detailed_bathymetry:
+                    missing = sum(row["n_missing_bathymetry_directions"] for row in metrics)
+                    if missing:
+                        days = sum(row["n_missing_bathymetry_days"] for row in metrics)
+                        logger.warning(
+                            "{} | пропуски батиметрии: пар точка–азимут={}, точка–день={}",
+                            self.label(current, key), missing, days,
+                        )
         except seq.InvalidScenarioError as exc:
             logger.debug("Геометрия {} отклонена: {}", key[:8], exc)
             self.store.add_score(key, None)
@@ -178,6 +216,23 @@ def random_gene(points, rng):
     return rng.choice(points), rng.uniform(0, math.tau), rng.uniform(-1, 1)
 
 
+def ga_proposals(cfg, options, target, starts, counts, bounds, points, n, parents, rng):
+    for attempt in range(1, cfg.construction_attempts + 1):
+        if parents and rng.random() >= options.immigrant_probability:
+            def tournament():
+                return min(rng.choices(parents, k=cfg.tournament_size), key=lambda p: p[0])[1]
+            genes = list(tournament())
+            if n and rng.random() < cfg.crossover_probability:
+                genes = [rng.choice((a, b)) for a, b in zip(genes, tournament())]
+            if n and rng.random() < cfg.mutation_probability:
+                for i in rng.sample(range(n), math.ceil(n * cfg.mutation_fraction)):
+                    genes[i] = random_gene(points, rng)
+        else:
+            genes = [random_gene(points, rng) for _ in range(n)]
+        plan = seq.decode(target, starts, counts, genes, bounds)
+        yield attempt, genes, plan, digest(plan) if plan is not None else None, rng.getstate()
+
+
 def evolve(cfg, options, target, starts, counts, weights, scorer, store, state, publish):
     max_gen = cfg.epochs * cfg.generations
     bounds = seq.stage_bounds(counts, options.stage_size_tolerance)
@@ -192,33 +247,33 @@ def evolve(cfg, options, target, starts, counts, weights, scorer, store, state, 
         best, best_score = state["plan"], state["best_score"]
         accepted = 0
         last = -math.inf
-        for attempt in range(1, cfg.construction_attempts + 1):
-            if len(population) >= cfg.population_size:
-                break
+        consumed_rng = rng.getstate()
+
+        def prefetch(batch):
+            known = new.copy()
+            states = []
+            for _, _, plan, key, _ in batch:
+                if plan is not None and key not in known and not store.was_seen(key):
+                    known.add(key)
+                    states.extend(cumulative(plan))
+            scorer.prefetch(states)
+
+        proposals = ga_proposals(cfg, options, target, starts, counts, bounds, points, n, parents, rng)
+        batches = scorer.pool.batches(proposals, lambda: cfg.population_size - len(population), prefetch)
+        for attempt, genes, plan, key, consumed_rng in (
+            batches if len(population) < cfg.population_size else ()
+        ):
             if time.monotonic() - last >= cfg.progress_interval_s:
                 logger.info("ГА {}/{} | попытка {}/{} | новых={}/{} | CWEF={} | кеш={}",
                             gen + 1, max_gen, attempt, cfg.construction_attempts, accepted,
                             cfg.population_size - min(len(parents), cfg.elite_count),
                             scorer.calculated, scorer.hits)
                 last = time.monotonic()
-            if parents and rng.random() >= options.immigrant_probability:
-                def tournament():
-                    return min(rng.choices(parents, k=cfg.tournament_size), key=lambda p: p[0])[1]
-                genes = list(tournament())
-                if n and rng.random() < cfg.crossover_probability:
-                    genes = [rng.choice((a, b)) for a, b in zip(genes, tournament())]
-                if n and rng.random() < cfg.mutation_probability:
-                    for i in rng.sample(range(n), math.ceil(n * cfg.mutation_fraction)):
-                        genes[i] = random_gene(points, rng)
-            else:
-                genes = [random_gene(points, rng) for _ in range(n)]
-            plan = seq.decode(target, starts, counts, genes, bounds)
             if plan is None:
                 store.event(gen + 1, attempt, 0, "decode",
                             seed=genes[0][0] if genes else None,
                             note="Decoder found no complete connected plan")
                 continue
-            key = digest(plan)
             if key in new or store.was_seen(key):
                 store.event(gen + 1, attempt, 0, "duplicate", plan=plan)
                 continue
@@ -243,8 +298,11 @@ def evolve(cfg, options, target, starts, counts, weights, scorer, store, state, 
             store.event(gen + 1, attempt, len(plan) + 1, "leader" if improved else "worse",
                         plan=plan, score=score, best=best_score, score_kind="Weighted plan score",
                         note="Compared with the best complete plan so far")
-            if n == 0:
+            if n == 0 or len(population) >= cfg.population_size:
                 break
+        batches.close()
+        scorer.pool.discard()
+        rng.setstate(consumed_rng)
         if not population:
             raise RuntimeError("Нет допустимого плана. Проверьте размеры этапов и допуск.")
         population.sort(key=lambda p: p[0])
@@ -283,20 +341,33 @@ def greedy(cfg, options, run, target, starts, counts, scorer, store, state, publ
             hi = min(hi, len(remaining) - future)
             tried = set()
             last = -math.inf
-            for trial in range(1, run.greedy_trials + 1):
+            n = len(remaining)
+
+            def decode(gene, low, high):
+                return seq.decode(remaining, front, (nominal, n - nominal), (gene,),
+                                  ((low, high), (n - high, n - low)))
+
+            def proposals():
+                for trial in range(1, run.greedy_trials + 1):
+                    gene = random_gene(points, rng)
+                    yield trial, gene, decode(gene, lo, hi)
+
+            def prefetch(batch):
+                scorer.prefetch(built | cut[0] for _, _, cut in batch
+                                if cut is not None and cut[0] not in tried)
+
+            for trial, gene, nominal_cut in scorer.pool.batches(proposals(), lambda: run.greedy_trials,
+                                                                prefetch):
                 if time.monotonic() - last >= cfg.progress_interval_s:
                     logger.info("Жадный {}/{} | кандидат {}/{} | CWEF={} | кеш={}", i + 1,
                                 len(counts), trial, run.greedy_trials, scorer.calculated, scorer.hits)
                     last = time.monotonic()
                 # Два блока здесь проверяют только геометрию остатка, не его CWEF.
-                n = len(remaining)
-                gene = random_gene(points, rng)
                 ranges = ((lo, hi), (1, n - future)) if future == 1 and best is None else ((lo, hi),)
                 for sub, (low, high) in enumerate(ranges):
                     if (low, high) != (lo, hi) and best is not None:
                         break
-                    cut = seq.decode(remaining, front, (nominal, n - nominal), (gene,),
-                                     ((low, high), (n - high, n - low)))
+                    cut = nominal_cut if (low, high) == (lo, hi) else decode(gene, low, high)
                     if cut is None:
                         store.event(i + 1, trial, sub, "decode", plan=plan, seed=gene[0],
                                     note=f"No connected cut in range {low}-{high} cells")
@@ -314,6 +385,7 @@ def greedy(cfg, options, run, target, starts, counts, scorer, store, state, publ
                     store.event(i + 1, trial, sub, status, plan=[*plan, part], score=value,
                                 best=best_score, active=i + 1,
                                 note="Compared with candidates for this stage")
+            scorer.pool.discard()
         if best is None:
             if future:
                 logger.warning("Связный промежуточный срез не найден. Заходка {} закрывает "
@@ -337,6 +409,8 @@ def greedy(cfg, options, run, target, starts, counts, scorer, store, state, publ
 def run_search(cfg, options, run, objective=seq.mean_normal_cwef):
     if run.mode not in {"ga", "greedy"} or run.greedy_trials < 1:
         raise ValueError("Нужны mode=ga/greedy и положительное greedy_trials.")
+    if type(run.evaluation_workers) is not int or run.evaluation_workers < 1:
+        raise ValueError("evaluation_workers должно быть положительным целым.")
     if (run.make_animation or run.render_only) and min(cfg.figure_width, cfg.figure_height) < 320:
         raise ValueError("Для GIF нужны figure_width и figure_height не меньше 320.")
     for value in (options.stage_size_tolerance, run.greedy_tail_tolerance):
@@ -366,11 +440,15 @@ def run_search(cfg, options, run, objective=seq.mean_normal_cwef):
 
 
 def run_locked(cfg, options, run, objective, path, directory):
+    grid_cfg = cfg
     geometry = seq.SequenceGeometry(cfg, build_default_target=path is None)
     physics_cfg = seq.prepare_bathymetry(cfg)
     code_files = (
         "sequential_resume.py", "sequential_animation.py", "sequential.py", "geometry.py", "anchored.py",
         "optimize.py", "physics.py", "bathymetry.py", "bathymetry_policy.py", "config.py",
+        "parallel_evaluation.py",
+        "../src/waves/nearshore/breaking.py", "../src/waves/nearshore/shoaling.py",
+        "../src/waves/nearshore/refraction.py", "../src/waves/nearshore/nearshore_transformer.py",
     )
     settings = asdict(physics_cfg)
     presentation = {
@@ -382,7 +460,7 @@ def run_locked(cfg, options, run, objective, path, directory):
         objective=[run.objective_id, objective.__module__, getattr(objective, "__qualname__", type(objective).__name__)],
         inputs=[path_stamp(p) for p in (
             path, cfg.coastline_path, cfg.weather_path, cfg.land_path, physics_cfg.bathymetry_path)],
-        implementation={name: sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+        implementation={name: sha256((Path(__file__).resolve().parent / name).read_bytes()).hexdigest()
                         for name in code_files},
     )))
 
@@ -415,6 +493,7 @@ def run_locked(cfg, options, run, objective, path, directory):
                 store.put("target", target)
         seq.write_json(directory / "config.json", {
             **manifest, "nominal_cell_counts": counts, "animation": presentation,
+            "evaluation_workers": run.evaluation_workers,
         })
         seq.write_json(directory / "target.geojson",
                        collection([feature(geometry._fill(target), kind="reclamation", area_m2=area)]))
@@ -460,12 +539,19 @@ def run_locked(cfg, options, run, objective, path, directory):
         if not state["done"] and not run.render_only:
             evaluator = seq.Evaluator(cfg, geometry)
             try:
-                scorer = Scorer(store, evaluator, geometry, objective)
-                store.event(0, 0, 0, "baseline", score=store.get_score(digest(frozenset()))[0])
-                if run.mode == "ga":
-                    evolve(cfg, options, target, starts, counts, weights, scorer, store, state, publish)
-                else:
-                    greedy(cfg, options, run, target, starts, counts, scorer, store, state, publish)
+                pool = EvaluationPool(run.evaluation_workers, grid_cfg, cfg, path is None, target,
+                                      run.detailed_worker_bathymetry)
+                try:
+                    logger.info("Оценка CWEF | процессов={}", run.evaluation_workers)
+                    scorer = Scorer(store, evaluator, geometry, objective, pool,
+                                    run.detailed_worker_bathymetry)
+                    store.event(0, 0, 0, "baseline", score=store.get_score(digest(frozenset()))[0])
+                    if run.mode == "ga":
+                        evolve(cfg, options, target, starts, counts, weights, scorer, store, state, publish)
+                    else:
+                        greedy(cfg, options, run, target, starts, counts, scorer, store, state, publish)
+                finally:
+                    pool.close()
             finally:
                 evaluator.close()
         if run.make_animation or run.render_only:
@@ -494,6 +580,7 @@ def main():
     root = seq.PROJECT_ROOT
     mode = "ga"  # Для отдельного жадного запуска: "greedy".
     mode = "greedy"  # Для отдельного жадного запуска: "greedy".
+    evaluation_workers = 4  # 1: исходный последовательный порядок оценки без пула.
     render_only = False  # True: собрать GIF из журнала, не продолжая поиск.
     cfg = seq.Config(
         coastline_path=root / "Kaliningrad/data/coastline/kaliningrad_OFFSET_merged.geojson",
@@ -501,17 +588,24 @@ def main():
         land_path=None, bathymetry_path=None, bathymetry_auto_download=True,
         bathymetry_cache_directory=root / "dalain/data/bathymetry",
         center_lon=19.95, center_lat=54.74, target_area_m2=1_000_000, cell_side_m=20,
-        search_radius_m=1_000, evaluation_radius_m=1_250, connection="attached", sea_side="right",
+        search_radius_m=2_000, evaluation_radius_m=3_000, connection="attached", sea_side="right",
         start_date="2025-01-01", end_date="2025-12-31", direction_count=36,
         point_spacing_m=50, tangent_delta_m=20, epochs=2, generations=12,
         population_size=12, construction_attempts=300, random_seed=42, progress_interval_s=5,
         animation_fps=8, figure_width=850, figure_height=720,
     )
-    options = seq.SequenceConfig(target_path=None, stage_count=5, stage_size_tolerance=0.10,
-                                 stage_cell_counts=None, stage_weights=None)
-    run = RunOptions(directory=root / "dalain/output/resumable_animated" / mode,
+    options = seq.SequenceConfig(
+        target_path=root / "dalain/output/20261101T181008_543366Z/solutions/solution_00000865.geojson",
+        stage_count=20,
+        stage_size_tolerance=0.30,
+        stage_cell_counts=None,
+        stage_weights=None,
+    )
+
+    run = RunOptions(directory=root / "dalain/output/resumable_fast" / mode,
                      mode=mode, greedy_trials=48, greedy_tail_tolerance=0.30,
-                     make_animation=True, render_only=render_only)
+                     make_animation=True, render_only=render_only,
+                     evaluation_workers=evaluation_workers)
     run_search(cfg, options, run)
 
 

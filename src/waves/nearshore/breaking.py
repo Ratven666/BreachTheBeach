@@ -27,10 +27,21 @@ class BreakingModel:
             h = 10.0
             return float(min(hs_offshore, self.gamma_b * h)), float(h)
 
-        # Инициализируем fallback — самое мелкое место
-        h_break = float(np.sort(valid)[0])
+        # Для штатного K_s величина Hs*K_s(h) не растёт с h,
+        # если Hs >= 0, а gamma_b*h не убывает. Значит, либо первая
+        # глубина подходит, либо не подходит ни одна. Вторая ветка
+        # штатного алгоритма всё равно возвращает ту же первую глубину.
+        h_break = float(valid.min())
         hs_break = float(self.gamma_b * h_break)
+        if (
+            type(self.shoaling_model) is ShoalingModel
+            and np.isfinite(hs_offshore) and hs_offshore >= 0
+            and np.isfinite(h_deep / 0.1)
+            and np.isfinite(self.gamma_b) and self.gamma_b >= 0
+        ):
+            return hs_break, h_break
 
+        # Сохраняем исходную логику для сторонних моделей и нетипичных входов.
         for h in np.sort(valid):
             h_val = float(h)
             # Используем ShoalingModel вместо дублирования формулы

@@ -181,10 +181,8 @@ def connected_cut(remaining, order, lo, hi, preferred):
     return best
 
 
-def decode(target, starts, counts, genes, bounds=None):
+def _decode_connected_remainder(target, starts, counts, genes, bounds):
     """Гены: точка притяжения, направление и предпочтительный сдвиг размера."""
-    if bounds is None:
-        bounds = stage_bounds(counts, 0.0)
     suffix_min = [0] * (len(counts) + 1)
     suffix_max = suffix_min.copy()
     for i in range(len(counts) - 1, -1, -1):
@@ -234,6 +232,129 @@ def decode(target, starts, counts, genes, bounds=None):
         front.difference_update(stage)
         front.update(c for cell in stage for c in neighbours(cell) if c in remaining)
     raise AssertionError("Нет последней заходки")
+
+
+def _component_sizes(remaining, max_components, min_size):
+    """Проверка остатка без построения полигонов и без пересчёта волн."""
+    unseen = set(remaining)
+    sizes = []
+    while unseen:
+        if len(sizes) == max_components:
+            return None
+        first = unseen.pop()
+        stack = [first]
+        size = 0
+        while stack:
+            cell = stack.pop()
+            size += 1
+            for other in neighbours(cell):
+                if other in unseen:
+                    unseen.remove(other)
+                    stack.append(other)
+        if size < min_size:
+            return None
+        sizes.append(size)
+    return sizes
+
+
+def _fallback_decode(target, starts, counts, genes, bounds):
+    # Лимиты на один геном. Не меняют допустимые размеры заходок.
+    choices_per_stage = 5
+    max_cut_checks = 36
+    suffix_low = [0] * (len(counts) + 1)
+    suffix_high = suffix_low.copy()
+    for index in range(len(counts) - 1, -1, -1):
+        suffix_low[index] = suffix_low[index + 1] + bounds[index][0]
+        suffix_high[index] = suffix_high[index + 1] + bounds[index][1]
+    checks = 0
+
+    def order_from(seed, remaining, limit, dx, dy, compact):
+        order, seen, heap = [], {seed}, [(0.0, seed)]
+        while heap and len(order) < limit:
+            _, cell = heappop(heap)
+            order.append(cell)
+            for c in neighbours(cell):
+                if c not in remaining or c in seen:
+                    continue
+                seen.add(c)
+                x, y = c[0] - seed[0], c[1] - seed[1]
+                key = x * dx + y * dy
+                if compact:
+                    key += 2 * (x * x + y * y) ** 0.5
+                heappush(heap, (key, c))
+        return order
+
+    def visit(index, remaining, front):
+        nonlocal checks
+        low, high = bounds[index]
+        n = len(remaining)
+        lo = max(low, n - suffix_high[index + 1])
+        hi = min(high, n - suffix_low[index + 1])
+        if lo > hi or not front:
+            return None
+        left = len(counts) - index - 1
+        if not left:
+            return (remaining,) if is_connected(remaining) else None
+        future = bounds[index + 1:]
+        min_size = min(b[0] for b in future)
+        max_size = max(b[1] for b in future)
+        (x, y), angle, bias = genes[index]
+        dx, dy = math.cos(angle), math.sin(angle)
+        nearest = sorted(front, key=lambda c: ((c[0] - x)**2 + (c[1] - y)**2, c))[:2]
+        directional = min(front, key=lambda c: (c[0] * dx + c[1] * dy, c))
+        methods = dict.fromkeys(
+            [(nearest[0], False), (nearest[0], True), (directional, False)]
+            + [(seed, True) for seed in nearest[1:]]
+        )
+        grids = []
+        for seed, compact in methods:
+            order = order_from(seed, remaining, hi, dx, dy, compact)
+            end = len(order)
+            if end < lo:
+                continue
+            preferred = min(end, max(lo, counts[index] + round(bias * (high - counts[index]))))
+            probe = tuple(dict.fromkeys((preferred, end, lo, (lo + end) // 2,
+                                         (preferred + end) // 2, (preferred + lo) // 2)))
+            grids.append((order, probe))
+        considered = set()
+        branches = 0
+        # Чередуем способы роста: один неудачный порядок не исчерпывает лимит.
+        for rank in range(max((len(probe) for _, probe in grids), default=0)):
+            for order, probe in grids:
+                if checks >= max_cut_checks or branches >= choices_per_stage:
+                    return None
+                if rank >= len(probe):
+                    continue
+                part = frozenset(order[:probe[rank]])
+                if part in considered:
+                    continue
+                considered.add(part)
+                checks += 1
+                rest = remaining - part
+                sizes = _component_sizes(rest, left, min_size)
+                if (sizes is None
+                        or sum((size + max_size - 1) // max_size for size in sizes) > left
+                        or sum(size // min_size for size in sizes) < left):
+                    continue
+                updated = set() if index == 0 else front - part
+                updated.update(c for cell in part for c in neighbours(cell) if c in rest)
+                branches += 1
+                suffix = visit(index + 1, rest, updated)
+                if suffix is not None:
+                    return (part, *suffix)
+        return None
+
+    return visit(0, frozenset(target), set(starts) & target)
+
+
+def decode(target, starts, counts, genes, bounds=None):
+    """Связные заходки фиксированных размеров с ограниченным запасным поиском."""
+    if bounds is None:
+        bounds = stage_bounds(counts, 0.0)
+    plan = _decode_connected_remainder(target, starts, counts, genes, bounds)
+    if plan is not None or len(counts) < 2:
+        return plan
+    return _fallback_decode(target, starts, counts, genes, bounds)
 
 
 def search(cfg, target, starts, counts, score_plan, rng, immigrant_probability, bounds=None):

@@ -595,14 +595,15 @@ def main():
         animation_fps=8, figure_width=850, figure_height=720,
     )
     options = seq.SequenceConfig(
-        target_path=root / "dalain/output/20261101T181008_543366Z/solutions/solution_00000865.geojson",
+        target_path=None,
+        # target_path=root / "dalain/output/20261101T181008_543366Z/solutions/solution_00000865.geojson",
         stage_count=20,
         stage_size_tolerance=0.30,
         stage_cell_counts=None,
         stage_weights=None,
     )
 
-    run = RunOptions(directory=root / "dalain/output/resumable_fast" / mode,
+    run = RunOptions(directory=root / "dalain/output/resumable_fast_2" / mode,
                      mode=mode, greedy_trials=48, greedy_tail_tolerance=0.30,
                      make_animation=True, render_only=render_only,
                      evaluation_workers=evaluation_workers)
